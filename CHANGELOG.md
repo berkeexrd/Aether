@@ -5,6 +5,24 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), versions follow
 
 ## [Unreleased]
 
+### Own notification system, pinning by drag & drop, Wallpaper Engine, widget sizes
+- **Notifications drawn by Aether**: Windows notifications now appear as Aether glass cards sliding in from the top-right or bottom-right corner. Cards stack (up to four), pause while hovered, show the app icon, open the app on click and close with the close button or a right click. Windows' own banners are moved off screen while this is on; the notification centre keeps the history.
+- Notifications stay quiet while a game, a full-screen video or a presentation is running, and during Do not disturb.
+- New **Notifications** section in the Settings Center (General): on/off, Do not disturb, corner, duration, "also in the island" and a test button. The notification panel got a Do not disturb switch and a shortcut to these settings. The Dynamic Island only announces notifications when it is enabled there (or when Aether's notifications are off).
+- Notification changes are detected within a fraction of a second instead of on a 2-second poll.
+- **Pin by dragging**: drop a desktop icon on the bar to pin it; the dock lights up and an insertion line shows where it will land. Shortcuts are pinned as the program they start, so the program's windows share the button. Start menu apps have a new "Pin to bar" entry.
+- **Wallpaper Engine**: while it is running, the picture picked in Aether (and each slideshow step) is sent to it as well, and the Desktop page shows whether it was detected.
+- **Resizable desktop widgets**: drag the corner of a card or use `Ctrl` + wheel; sizes are also available as sliders in Settings (Widgets, Size) and can be reset from the right-click menu.
+
+### Settings Center redesign
+- New window shell: glass sidebar with brand tile, search pill, grouped navigation with icon tiles and hover glow, status card, header with page icon, animated page transitions and a styled scrollbar.
+- Cards, rows, dividers and the theme background were reworked to follow the active theme; the Desktop page is reachable from the sidebar.
+- The window drops to about 12 fps after two seconds without input, so leaving it open costs almost nothing.
+
+### Calendar and weather
+- Calendar: months slide when you change them and the title animates; seasonal effects (snow, petals, sun, falling leaves) cross-fade with the month.
+- Desktop weather card: taller card tinted by the sky, three-day forecast rows, sunrise and sunset.
+
 ### Start-up animations and frame-by-frame recording
 - Start-up reveal: the island drops in from the screen edge, widget cards fade and rise one after another, the desktop wallpaper fades in from black and icons appear in sequence (respects reduced motion).
 - `Aether.exe --record <folder> [--fps 60] [--seconds 19]` renders on a virtual clock and saves every frame as PNG (frame-locked, no dropped frames), with a scripted tour of the whole shell (island states, notification, Start menu, desktop menu, Explorer, Recycle Bin, then every colour theme); steps that open other programs are timed in real time (frames.ffconcat keeps each frame's duration); recordings are always in English and the original theme and wallpaper are restored. `tools\record_showcase.bat` records and builds an MP4, `tools\make_video.bat` converts existing frames (needs ffmpeg).

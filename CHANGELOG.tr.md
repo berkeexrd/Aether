@@ -2,6 +2,24 @@
 
 ## [Yayınlanmadı]
 
+### Aether'in kendi bildirim sistemi, sürükleyerek sabitleme, Wallpaper Engine, widget boyutları
+- **Aether'in çizdiği bildirimler**: Windows bildirimleri artık sağ üst veya sağ alt köşeden kayarak gelen Aether cam kartları olarak görünür. Kartlar üst üste dizilir (en fazla dört), üstüne gelince durur, uygulama simgesini gösterir, tıklayınca uygulamayı açar, kapatma düğmesi veya sağ tıkla kapanır. Bu açıkken Windows'un kendi bildirim pencereleri ekran dışına taşınır; geçmiş bildirim merkezinde kalır.
+- Oyun, tam ekran video veya sunum sırasında ve Rahatsız etme açıkken bildirimler sessiz kalır.
+- Ayarlar Merkezi'nde (Genel) yeni **Bildirimler** bölümü: aç/kapa, Rahatsız etme, köşe, süre, "Island'da da göster" ve deneme düğmesi. Bildirim paneline Rahatsız etme anahtarı ve bu ayarlara kısayol eklendi. Dynamic Island, bildirimleri yalnızca burada açıksa (veya Aether bildirimleri kapalıysa) duyurur.
+- Bildirim değişiklikleri 2 saniyelik yoklama yerine saniyenin küçük bir bölümünde algılanır.
+- **Sürükleyerek sabitleme**: masaüstü simgesini çubuğa bırakınca sabitlenir; dock ışıklanır ve ekleme çizgisi nereye gireceğini gösterir. Kısayollar başlattıkları program olarak sabitlenir, böylece programın pencereleri aynı butonu paylaşır. Başlat menüsündeki uygulamalara yeni "Çubuğa sabitle" seçeneği eklendi.
+- **Wallpaper Engine**: çalışırken Aether'de seçilen resim (ve slayt gösterisinin her adımı) ona da gönderilir; Masaüstü sayfası algılanıp algılanmadığını gösterir.
+- **Yeniden boyutlandırılabilir masaüstü widget'ları**: kartın köşesinden sürükle veya `Ctrl` + tekerlek kullan; boyutlar Ayarlar'da (Widget'lar, Boyut) kaydırıcılarla da ayarlanır ve sağ tık menüsünden sıfırlanır.
+
+### Ayarlar Merkezi yeniden tasarımı
+- Yeni pencere kabuğu: marka kutulu cam kenar çubuğu, arama hapı, simge kutulu ve hover parlamalı gruplu gezinme, durum kartı, sayfa simgeli üst başlık, animasyonlu sayfa geçişleri ve stilli kaydırma çubuğu.
+- Kartlar, satırlar, ayraçlar ve tema arka planı aktif temayı izleyecek şekilde yenilendi; Masaüstü sayfasına kenar çubuğundan ulaşılır.
+- Pencere, iki saniye girdi olmazsa yaklaşık 12 fps'e düşer; açık bırakmanın maliyeti neredeyse sıfırdır.
+
+### Takvim ve hava durumu
+- Takvim: ay değişince kayarak geçer ve başlık animasyonludur; mevsim efektleri (kar, çiçek yaprakları, güneş, düşen yapraklar) aya göre yumuşakça geçiş yapar.
+- Masaüstü hava durumu kartı: gökyüzüne göre renklenen daha uzun kart, üç günlük tahmin satırları, gün doğumu ve batımı.
+
 ### Açılış animasyonları ve kare kare kayıt
 - Açılış animasyonu: ada ekran kenarından iniyor, widget kartları sırayla belirip yükseliyor, duvar kağıdı siyahtan açılıyor ve simgeler sırayla beliriyor (azaltılmış hareket ayarına uyar).
 - `Aether.exe --record <klasör> [--fps 60] [--seconds 19]` sanal saatle çalışıp her kareyi PNG olarak kaydeder (kare kaçırmaz) ve tüm kabuğu otomatik gezer (ada modları, bildirim, Başlat menüsü, masaüstü menüsü, Explorer, Geri Dönüşüm Kutusu, sonda her renk teması); başka programları açan adımlar gerçek zamanlı kaydedilir (frames.ffconcat her karenin süresini tutar); kayıtlar her zaman İngilizcedir ve özgün tema ile duvar kağıdı geri yüklenir. `tools\record_showcase.bat` kaydedip MP4 üretir, `tools\make_video.bat` mevcut kareleri videoya çevirir (ffmpeg gerekir).
