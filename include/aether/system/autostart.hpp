@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <string>
+#include "aether/system/trial.hpp"
 
 namespace aether::system::autostart {
 
@@ -41,6 +42,9 @@ inline void SetBarTask(bool on) {
     ShellExecuteW(nullptr, L"runas", L"schtasks.exe", args.c_str(), nullptr, SW_HIDE);
 }
 
-inline void Apply(bool on) { SetRunKey(on); SetBarTask(on); }
+inline void Apply(bool on) {
+    if (trial::IsTrial()) return;          // a trial leaves nothing behind: no Run entry, no scheduled task
+    SetRunKey(on); SetBarTask(on);
+}
 
 } // namespace aether::system::autostart

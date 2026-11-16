@@ -7,6 +7,7 @@
 
 #pragma comment(lib, "winmm.lib")
 #include "aether/core/log.hpp"
+#include "aether/core/crash.hpp"
 #include "aether/core/timer.hpp"
 #include "aether/core/frame_recorder.hpp"
 #include "aether/core/i18n.hpp"
@@ -22,6 +23,7 @@
 #include "aether/system/taskbar_service.hpp"
 #include "aether/media/media_service.hpp"
 #include "aether/island/island_window.hpp"
+#include "aether/system/notify_cfg.hpp"
 #include "aether/bar/notifications.hpp"
 #include "aether/widgets/widget_window.hpp"
 #include "aether/ui/settings_window.hpp"
@@ -30,6 +32,8 @@ using namespace aether;
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     (void)hInstance;
+    aether::core::InstallCrashHandler(L"Aether");   // mini dump + crash.log in %APPDATA%\Aether\crash if the island ever dies
+
     // Enable 1ms multimedia timer resolution for high refresh rates (144Hz / 240Hz)
     timeBeginPeriod(1);
 
@@ -41,11 +45,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     const bool recordRun = core::ParseRecordArgs().on;
     bool tookOver = false;
     HANDLE quitEvt = CreateEventW(nullptr, TRUE, FALSE, L"Local\\AetherMainQuit");
+    // "--settings [desktop]" from another program (the desktop's Aether icon, a shortcut): the running copy opens its Settings Center
+    HANDLE settingsEvt = CreateEventW(nullptr, FALSE, FALSE, L"Local\\AetherShowSettings");
+    HANDLE settingsDeskEvt = CreateEventW(nullptr, FALSE, FALSE, L"Local\\AetherShowSettingsDesktop");
+    const bool wantSettings = wcsstr(GetCommandLineW(), L"--settings") != nullptr;
+    const bool wantDesktopPage = wantSettings && wcsstr(GetCommandLineW(), L"desktop") != nullptr;
     HANDLE once = CreateMutexW(nullptr, FALSE, L"Local\\AetherMainInstance");
     {
         const bool exists = GetLastError() == ERROR_ALREADY_EXISTS;
         if (exists) {
-            if (!recordRun) return 0;
+            if (!recordRun) {
+                if (wantSettings) { HANDLE e = wantDesktopPage ? settingsDeskEvt : settingsEvt; if (e) SetEvent(e); }
+                return 0;
+            }
             if (quitEvt) SetEvent(quitEvt);
         }
         const DWORD w = once ? WaitForSingleObject(once, exists ? 10000 : 0) : WAIT_FAILED;
@@ -136,7 +148,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     if (argList) {
         for (int i = 0; i < numArgs; ++i) {
             if (wcscmp(argList[i], L"--settings") == 0) {
-                ui::SettingsWindow::Instance().Show(true);
+                const bool desk = i + 1 < numArgs && _wcsicmp(argList[i + 1], L"desktop") == 0;
+                if (desk) ui::SettingsWindow::Instance().ShowTab(ui::SettingsTab::Desktop); else ui::SettingsWindow::Instance().Show(true);
             }
         }
         LocalFree(argList);
@@ -268,6 +281,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         }
 
         if (!recording && quitEvt && WaitForSingleObject(quitEvt, 0) == WAIT_OBJECT_0) break;   // a recording run asked this copy to step aside
+        if (settingsEvt && WaitForSingleObject(settingsEvt, 0) == WAIT_OBJECT_0) ui::SettingsWindow::Instance().Show(true);
+        if (settingsDeskEvt && WaitForSingleObject(settingsDeskEvt, 0) == WAIT_OBJECT_0) ui::SettingsWindow::Instance().ShowTab(ui::SettingsTab::Desktop);
         if (!running) break;
 
         float dt = static_cast<float>(timer.Tick());
@@ -323,7 +338,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
                 maxId = std::max(maxId, it.id);
                 if (lastNotifId >= 0 && it.id > lastNotifId && (!fresh || it.id > fresh->id)) fresh = &it;
             }
-            if (fresh && !quiet) {
+            if (fresh && !quiet && system::notifycfg::IslandAlso()) {
                 island::NotificationData nd;
                 nd.sourceApp = fresh->app;
                 nd.title = fresh->title.empty() ? fresh->app : fresh->title;
@@ -356,8 +371,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         // While animating: DO NOT SLEEP! The composition swap chain's Present(1, 0)
         // synchronizes directly to the monitor's hardware V-Blank (~4.16ms on 240Hz).
         // Only sleep when 100% idle and resting to yield 0% CPU.
+        const bool settingsOnly = ui::SettingsWindow::Instance().IsVisible() && !recording && !widgetsAnimating && !(island && !island->IsResting());
         if (!isAnimating) {
             MsgWaitForMultipleObjectsEx(0, nullptr, 250, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        } else if (settingsOnly && ui::SettingsWindow::Instance().IsIdle()) {
+            // The settings window is open but nobody has touched it for a while and nothing else moves:
+            // ~12 fps keeps caret blink / live values alive without redrawing at the monitor's refresh rate. Any input wakes the loop at once.
+            MsgWaitForMultipleObjectsEx(0, nullptr, 80, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         } else if (island && !island->IsSpringDriven()) {
             // Only ambient motion (audio bars, scrolling title): 60 fps is plenty and saves GPU/CPU.
             // With the settings window open, ~120 fps keeps it fluid without redrawing at the monitor's full rate.

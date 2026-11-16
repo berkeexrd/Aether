@@ -1,6 +1,8 @@
 #pragma once
 
 #include "aether/config/config_manager.hpp"
+#include "aether/ui/components.hpp"
+#include <vector>
 
 namespace aether::ui {
 
@@ -23,6 +25,8 @@ enum class SettingsTab {
 class SettingsPages {
 public:
     static void Render(SettingsTab activeTab);
+    // Runs a page without drawing it and records its sections / rows (used by the feature search).
+    static void CollectSearchIndex(SettingsTab tab, std::vector<UI::SearchEntry>& out);
     // First-run welcome / setup page (language, theme, autostart, wallpaper). Replaces the normal layout until finished.
     static bool WelcomeNeeded();
     static void RenderWelcome(float width, float height);

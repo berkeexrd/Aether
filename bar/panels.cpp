@@ -2,8 +2,10 @@
 #include "aether/bar/notifications.hpp"
 #include "aether/bar/wifi.hpp"
 #include "aether/bar/netstate.hpp"
+#include <netioapi.h>
 #include "aether/bar/ui_common.hpp"
 #include "aether/core/i18n.hpp"
+#include "aether/system/notify_cfg.hpp"
 #include "aether/render/glass.hpp"
 #include <shellapi.h>
 #include <algorithm>
@@ -26,6 +28,21 @@ inline float Frac(float v) { return v - std::floor(v); }
 inline float Clamp01(float v) { return std::clamp(v, 0.0f, 1.0f); }
 inline Color Mix(const Color& a, const Color& b, float t) { return Color{a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t}; }
 constexpr wchar_t kBell = 0xEA8F;
+
+std::wstring FmtRate(double bytesPerSec) {
+    const double bits = bytesPerSec * 8.0; wchar_t b[32];
+    if (bits >= 1e9) swprintf_s(b, L"%.2f Gb/s", bits / 1e9);
+    else if (bits >= 1e6) swprintf_s(b, L"%.1f Mb/s", bits / 1e6);
+    else if (bits >= 1e3) swprintf_s(b, L"%.0f kb/s", bits / 1e3);
+    else swprintf_s(b, L"%.0f b/s", bits);
+    return b;
+}
+std::wstring FmtLink(unsigned long long mbps) {
+    if (!mbps) return L"";
+    wchar_t b[32];
+    if (mbps >= 1000) swprintf_s(b, L"%g Gbps", static_cast<double>(mbps) / 1000.0); else swprintf_s(b, L"%llu Mbps", mbps);
+    return b;
+}
 }
 
 // =============================================================================================
@@ -342,7 +359,17 @@ void NotifyPanel::OnWheel(float n) { m_scrollTarget = std::max(0.0f, m_scrollTar
 
 void NotifyPanel::OnClick(int id, const Vec2&) {
     if (id == 1) NotificationFeed::Instance().DismissAll();
-    else if (id == 2) { ShellExecuteW(nullptr, L"open", L"ms-settings:notifications", nullptr, nullptr, SW_SHOWNORMAL); Hide(); }
+    else if (id == 2) {
+        // Aether's own settings (Settings Center); fall back to Windows' page when the app is not running
+        HANDLE e = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\AetherShowSettings");
+        if (e) { SetEvent(e); CloseHandle(e); }
+        else ShellExecuteW(nullptr, L"open", L"ms-settings:notifications", nullptr, nullptr, SW_SHOWNORMAL);
+        Hide();
+    }
+    else if (id == 3) {
+        const auto cfg = aether::system::notifycfg::Load();
+        aether::system::notifycfg::SetInt(L"dnd", cfg.dnd ? 0 : 1);
+    }
     else if (id >= 1000) {
         const size_t idx = static_cast<size_t>(id - 1000);
         if (idx < m_ids.size()) NotificationFeed::Instance().Dismiss(m_ids[idx]);
@@ -449,17 +476,31 @@ void NotifyPanel::OnDraw(ID2D1DeviceContext* c, const Rect& P) {
     }
     c->PopAxisAlignedClip();
 
-    // footer: Windows notification settings
-    Rect st{x, P.Bottom() - 52 * s, w, 38 * s};
+    // footer: do-not-disturb switch and Aether's notification settings
+    const auto ncfg = aether::system::notifycfg::Load();
+    const float fy = P.Bottom() - 52 * s, fh = 38 * s;
+    Rect dnd{x, fy, w * 0.5f - 4 * s, fh};
+    const bool dh = dnd.Contains(m_mouse);
+    Fill(c, dnd, 19 * s, ncfg.dnd ? Color{acc.r, acc.g, acc.b, dh ? 0.42f : 0.34f} : (dh ? W(0.13f) : W(0.07f))); AddHit(dnd, 3);
+    Text(c, ncfg.dnd ? i18n::Pick(L"Do not disturb: on", L"Rahatsız etme: açık") : i18n::Pick(L"Do not disturb", L"Rahatsız etme"), m_fCenter.Get(), dnd, W(ncfg.dnd ? 1.0f : 0.88f));
+    Rect st{dnd.Right() + 8 * s, fy, w * 0.5f - 4 * s, fh};
     Fill(c, st, 19 * s, st.Contains(m_mouse) ? W(0.13f) : W(0.07f)); AddHit(st, 2);
-    Text(c, i18n::Pick(L"Notification settings", L"Bildirim ayarları"), m_fCenter.Get(), st, W(0.88f));
+    Text(c, i18n::Pick(L"Settings", L"Ayarlar"), m_fCenter.Get(), st, W(0.88f));
 }
 
 // =============================================================================================
 //  Network
 // =============================================================================================
+void NetPanel::RefreshNet() {
+    const NetState ns = QueryNetState();
+    m_conn = ns.connected; m_inet = ns.internet; m_wifi = ns.wifi; m_eth = ns.ethernet; m_sig = ns.signal;
+    m_nname = ns.name; m_nip = ns.ip; m_adapter = ns.adapter; m_link = ns.linkMbps; m_if = ns.ifIndex;
+}
 void NetPanel::OnShow() {
     m_scroll = m_scrollTarget = 0; m_poll = 0; m_shown = m_time; m_sel.clear(); m_pass.clear(); m_expand = 0;
+    for (float& h : m_hist) h = 0.0f;
+    m_haveLast = false; m_rx = m_tx = 0; m_histMax = 125000.0f; m_sampleT = 0; m_nsT = 0;
+    RefreshNet();
     WifiService::Instance().ClearStatus();
     WifiService::Instance().Refresh(true);
 }
@@ -468,6 +509,27 @@ void NetPanel::OnTick(float dt) {
     if (m_poll > 12.0f) { m_poll = 0; WifiService::Instance().Refresh(true); }
     m_scroll += (m_scrollTarget - m_scroll) * std::min(1.0f, dt * 14.0f);
     m_expand += ((m_sel.empty() ? 0.0f : 1.0f) - m_expand) * std::min(1.0f, dt * 12.0f);
+    m_nsT += dt;
+    if (m_nsT > 2.5f) { m_nsT = 0; RefreshNet(); }
+    // live traffic of the active adapter, sampled twice a second
+    m_sampleT += dt;
+    if (m_sampleT >= 0.5f) {
+        MIB_IF_ROW2 row = {};
+        row.InterfaceIndex = m_if;
+        if (m_if && GetIfEntry2(&row) == NO_ERROR) {
+            const unsigned long long rx = row.InOctets, tx = row.OutOctets;
+            if (m_haveLast && m_lastIf == m_if) {
+                m_rx = (rx >= m_lastRx ? static_cast<double>(rx - m_lastRx) : 0.0) / m_sampleT;
+                m_tx = (tx >= m_lastTx ? static_cast<double>(tx - m_lastTx) : 0.0) / m_sampleT;
+            } else m_rx = m_tx = 0;
+            m_lastRx = rx; m_lastTx = tx; m_lastIf = m_if; m_haveLast = true;
+        } else { m_rx = m_tx = 0; m_haveLast = false; }
+        m_sampleT = 0;
+        for (int i = 0; i + 1 < kHist; ++i) m_hist[i] = m_hist[i + 1];
+        m_hist[kHist - 1] = static_cast<float>(m_rx + m_tx);
+        float mx = 125000.0f; for (float v : m_hist) mx = std::max(mx, v);
+        m_histMax += (mx - m_histMax) * 0.5f;
+    }
 }
 void NetPanel::OnWheel(float n) { m_scrollTarget = std::max(0.0f, m_scrollTarget - n * 60.0f * S()); }
 
@@ -517,8 +579,8 @@ void NetPanel::OnDraw(ID2D1DeviceContext* c, const Rect& P) {
     const Color acc = render::glass::kVioletLight, accD = render::glass::kVioletDeep;
     auto& wf = WifiService::Instance();
     const WifiState st = wf.Get();
-    const NetState ns = QueryNetState();
     const float x = P.x + 18 * s, w = P.width - 36 * s;
+    const bool on = (m_conn && st.radioOn) || m_eth;
 
     // header + Wi-Fi switch
     Text(c, i18n::Pick(L"Network", L"Ağ"), m_fTitle.Get(), Rect{x + 4 * s, P.y + 16 * s, 160 * s, 30 * s}, W(0.96f));
@@ -534,8 +596,8 @@ void NetPanel::OnDraw(ID2D1DeviceContext* c, const Rect& P) {
         Text(c, i18n::Pick(L"Wi-Fi", L"Wi-Fi"), m_fSmall.Get(), Rect{sw.x - 54 * s, sw.y, 48 * s, sw.height}, W(0.6f));
     }
 
-    // hero card: animated rings + current connection
-    Rect hero{x, P.y + 58 * s, w, 112 * s};
+    // hero card: connection, details chips and live traffic
+    Rect hero{x, P.y + 58 * s, w, 164 * s};
     {
         auto geo = m_dcomp->CreateSquircleGeometry(hero, 22 * s);
         if (geo) {
@@ -543,41 +605,75 @@ void NetPanel::OnDraw(ID2D1DeviceContext* c, const Rect& P) {
                 c->FillGeometry(geo.Get(), g.Get());
             D2D1_LAYER_PARAMETERS1 lp = D2D1::LayerParameters1(D2D1::InfiniteRect(), geo.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(), 1.0f, nullptr, D2D1_LAYER_OPTIONS1_NONE);
             c->PushLayer(&lp, nullptr);
-            const float cx = hero.x + 52 * s, cy = hero.Center().y;
-            const bool on = ns.connected && st.radioOn || ns.ethernet;
+            const float cx = hero.x + 41 * s, cy = hero.y + 41 * s;
             if (on) for (int i = 0; i < 3; ++i) {
                 const float ph = Frac(m_time * 0.45f + i / 3.0f);
-                m_brush->SetColor(D2D1::ColorF(acc.r, acc.g, acc.b, (1 - ph) * 0.45f));
-                c->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), (16 + ph * 78) * s, (16 + ph * 78) * s), m_brush.Get(), 1.6f * s);
+                m_brush->SetColor(D2D1::ColorF(acc.r, acc.g, acc.b, (1 - ph) * 0.40f));
+                c->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), (14 + ph * 58) * s, (14 + ph * 58) * s), m_brush.Get(), 1.5f * s);
             }
-            if (st.scanning) {   // radar sweep
+            if (st.scanning && st.radioOn) {   // radar sweep
                 const float a = m_time * 3.2f;
                 m_brush->SetColor(D2D1::ColorF(acc.r, acc.g, acc.b, 0.55f));
-                c->DrawLine(D2D1::Point2F(cx, cy), D2D1::Point2F(cx + std::cos(a) * 44 * s, cy + std::sin(a) * 44 * s), m_brush.Get(), 1.6f * s, nullptr);
+                c->DrawLine(D2D1::Point2F(cx, cy), D2D1::Point2F(cx + std::cos(a) * 40 * s, cy + std::sin(a) * 40 * s), m_brush.Get(), 1.6f * s, nullptr);
             }
             c->PopLayer();
             if (auto rim = m_dcomp->CreateLinearGradientBrush(W(0.30f), W(0.05f), D2D1::Point2F(hero.x, hero.y), D2D1::Point2F(hero.Right(), hero.Bottom()))) c->DrawGeometry(geo.Get(), rim.Get(), 1.0f * s);
-            Rect badge{cx - 22 * s, cy - 22 * s, 44 * s, 44 * s};
-            Fill(c, badge, 22 * s, Color{acc.r, acc.g, acc.b, on ? 0.95f : 0.25f});
-            Glyph(c, ns.ethernet && !ns.wifi ? gl::kGlyphEthernet : gl::kGlyphWifi, badge, W(on ? 1.0f : 0.6f), true);
-            std::wstring title = on ? (ns.name.empty() ? std::wstring(i18n::Pick(L"Connected", L"Bağlı")) : ns.name) : std::wstring(st.radioOn ? i18n::Pick(L"Not connected", L"Bağlı değil") : i18n::Pick(L"Wi-Fi is off", L"Wi-Fi kapalı"));
-            std::wstring sub = on ? (ns.internet ? std::wstring(i18n::Pick(L"Connected, internet access", L"Bağlı, internet erişimi var")) : std::wstring(i18n::Pick(L"No internet access", L"İnternet erişimi yok"))) : std::wstring(i18n::Pick(L"Choose a network below", L"Aşağıdan bir ağ seç"));
-            Text(c, title, m_fTitle.Get(), Rect{hero.x + 92 * s, hero.y + 22 * s, hero.width - 108 * s, 26 * s}, W(0.97f));
-            Text(c, sub, m_fSmall.Get(), Rect{hero.x + 92 * s, hero.y + 46 * s, hero.width - 108 * s, 22 * s}, W(0.62f));
-            if (on && !ns.ip.empty()) Text(c, ns.ip, m_fSmall.Get(), Rect{hero.x + 92 * s, hero.y + 64 * s, hero.width - 108 * s, 20 * s}, W(0.42f));
-            if (on && ns.wifi) {
-                Rect db{hero.x + 92 * s, hero.Bottom() - 34 * s, 104 * s, 26 * s};
+            Rect badge{cx - 25 * s, cy - 25 * s, 50 * s, 50 * s};
+            Fill(c, badge, 25 * s, Color{acc.r, acc.g, acc.b, on ? 0.95f : 0.25f});
+            Glyph(c, m_eth && !m_wifi ? gl::kGlyphEthernet : gl::kGlyphWifi, badge, W(on ? 1.0f : 0.6f), true);
+
+            const bool canDisc = on && m_wifi;
+            const float tx = hero.x + 82 * s, tw = hero.width - 82 * s - 16 * s - (canDisc ? 100 * s : 0);
+            std::wstring title = on ? (m_nname.empty() ? std::wstring(i18n::Pick(L"Connected", L"Bağlı")) : m_nname) : std::wstring(st.radioOn ? i18n::Pick(L"Not connected", L"Bağlı değil") : i18n::Pick(L"Offline", L"Çevrimdışı"));
+            std::wstring sub = on ? (m_inet ? std::wstring(i18n::Pick(L"Connected, internet access", L"Bağlı, internet erişimi var")) : std::wstring(i18n::Pick(L"No internet access", L"İnternet erişimi yok"))) : std::wstring(st.radioOn ? i18n::Pick(L"Choose a network below", L"Aşağıdan bir ağ seç") : i18n::Pick(L"Turn Wi-Fi on or plug in a cable", L"Wi-Fi'yi aç veya kablo tak"));
+            Text(c, title, m_fTitle.Get(), Rect{tx, hero.y + 16 * s, tw, 26 * s}, W(0.97f));
+            Text(c, sub, m_fSmall.Get(), Rect{tx, hero.y + 42 * s, hero.width - 82 * s - 16 * s, 22 * s}, W(0.62f));
+            if (canDisc) {
+                Rect db{hero.Right() - 16 * s - 92 * s, hero.y + 16 * s, 92 * s, 26 * s};
                 Fill(c, db, 13 * s, db.Contains(m_mouse) ? W(0.20f) : W(0.10f)); AddHit(db, 5);
                 Text(c, i18n::Pick(L"Disconnect", L"Bağlantıyı kes"), m_fCenter.Get(), db, W(0.88f));
-                // centre text is left-aligned; nudge via dedicated centred format below
             }
+
+            // detail chips: connection type, link speed, IP
+            if (on) {
+                float cxp = hero.x + 18 * s;
+                const float cyp = hero.y + 76 * s, chH = 22 * s;
+                auto chip = [&](const std::wstring& t, float a) {
+                    if (t.empty()) return;
+                    const float cw = 20 * s + 6.6f * s * static_cast<float>(t.size());
+                    if (cxp + cw > hero.Right() - 12 * s) return;
+                    Rect r{cxp, cyp, cw, chH};
+                    Fill(c, r, chH / 2, W(0.10f)); Stroke(c, r, chH / 2, W(0.10f));
+                    Text(c, t, m_fCenter.Get(), r, W(a));
+                    cxp += cw + 6 * s;
+                };
+                chip(m_wifi ? std::wstring(L"Wi-Fi") : std::wstring(L"Ethernet"), 0.9f);
+                chip(FmtLink(m_link), 0.8f);
+                chip(m_nip, 0.8f);
+                if (m_wifi && m_sig > 0) { wchar_t b[16]; swprintf_s(b, L"%d %%", m_sig); chip(b, 0.8f); }
+            }
+
+            // live traffic: bars + readouts
+            const Rect g{hero.x + 18 * s, hero.y + 108 * s, hero.width - 36 * s, 30 * s};
+            const float bw = g.width / static_cast<float>(kHist);
+            for (int i = 0; i < kHist; ++i) {
+                const float v = Clamp01(m_hist[i] / m_histMax);
+                const float bh = std::max(2.0f * s, v * g.height);
+                m_brush->SetColor(D2D1::ColorF(acc.r, acc.g, acc.b, on ? 0.22f + 0.65f * v : 0.12f));
+                c->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(g.x + i * bw + 0.7f * s, g.Bottom() - bh, g.x + (i + 1) * bw - 0.7f * s, g.Bottom()), 1.5f * s, 1.5f * s), m_brush.Get());
+            }
+            const float ry = hero.y + 140 * s;
+            Glyph(c, gl::kGlyphArrowDown, Rect{hero.x + 14 * s, ry, 20 * s, 18 * s}, W(0.6f));
+            Text(c, FmtRate(m_rx), m_fSmall.Get(), Rect{hero.x + 34 * s, ry, 110 * s, 18 * s}, W(0.75f));
+            Glyph(c, gl::kGlyphArrowUp, Rect{hero.x + hero.width * 0.5f, ry, 20 * s, 18 * s}, W(0.6f));
+            Text(c, FmtRate(m_tx), m_fSmall.Get(), Rect{hero.x + hero.width * 0.5f + 20 * s, ry, 110 * s, 18 * s}, W(0.75f));
         }
     }
 
     // networks header + rescan
     const float lt = hero.Bottom() + 14 * s;
     Text(c, i18n::Pick(L"Available networks", L"Kullanılabilir ağlar"), m_fSmall.Get(), Rect{x + 4 * s, lt, 220 * s, 24 * s}, W(0.55f));
-    {
+    if (st.adapter && st.radioOn) {
         Rect rf{P.Right() - 18 * s - 30 * s, lt - 3 * s, 30 * s, 30 * s};
         Fill(c, rf, 15 * s, rf.Contains(m_mouse) ? W(0.16f) : W(0.07f)); AddHit(rf, 2);
         D2D1_MATRIX_3X2_F old; c->GetTransform(&old);
@@ -592,9 +688,37 @@ void NetPanel::OnDraw(ID2D1DeviceContext* c, const Rect& P) {
     const float since = m_time - m_shown;
     float contentH = 0;
     c->PushAxisAlignedClip(D2D1::RectF(P.x, viewTop - 2 * s, P.Right(), viewBottom), D2D1_ANTIALIAS_MODE_ALIASED);
-    if (!st.adapter) Text(c, i18n::Pick(L"No Wi-Fi adapter found", L"Wi-Fi bağdaştırıcısı bulunamadı"), m_fCBody.Get(), Rect{P.x, viewTop + 30 * s, P.width, 28 * s}, W(0.5f));
-    else if (!st.radioOn) Text(c, i18n::Pick(L"Turn Wi-Fi on to see networks", L"Ağları görmek için Wi-Fi'yi aç"), m_fCBody.Get(), Rect{P.x, viewTop + 30 * s, P.width, 28 * s}, W(0.5f));
-    else if (st.nets.empty()) Text(c, st.scanning ? i18n::Pick(L"Searching for networks...", L"Ağlar aranıyor...") : i18n::Pick(L"No networks found", L"Ağ bulunamadı"), m_fCBody.Get(), Rect{P.x, viewTop + 30 * s, P.width, 28 * s}, W(0.5f));
+    {   // empty states: a real card instead of one faint line
+        const bool noAdapter = !st.adapter, off = st.adapter && !st.radioOn, searching = st.adapter && st.radioOn && st.nets.empty();
+        if (noAdapter || off || searching) {
+            const float cx = P.x + P.width * 0.5f, cy = viewTop + 52 * s;
+            Rect disc{cx - 32 * s, cy - 32 * s, 64 * s, 64 * s};
+            Fill(c, disc, 32 * s, W(0.07f)); Stroke(c, disc, 32 * s, W(0.10f));
+            if (searching && st.scanning) {
+                for (int i = 0; i < 2; ++i) {
+                    const float ph = Frac(m_time * 0.8f + i * 0.5f);
+                    m_brush->SetColor(D2D1::ColorF(acc.r, acc.g, acc.b, (1 - ph) * 0.45f));
+                    c->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), (32 + ph * 26) * s, (32 + ph * 26) * s), m_brush.Get(), 1.4f * s);
+                }
+            }
+            Glyph(c, gl::kGlyphWifi, disc, W(off || noAdapter ? 0.35f : 0.8f), true);
+            if (off || noAdapter) {                                     // slash through the icon
+                m_brush->SetColor(D2D1::ColorF(1, 1, 1, 0.45f));
+                c->DrawLine(D2D1::Point2F(cx - 14 * s, cy - 14 * s), D2D1::Point2F(cx + 14 * s, cy + 14 * s), m_brush.Get(), 2.2f * s, nullptr);
+            }
+            const std::wstring t1 = noAdapter ? std::wstring(i18n::Pick(L"No Wi-Fi adapter", L"Wi-Fi bağdaştırıcısı yok")) : off ? std::wstring(i18n::Pick(L"Wi-Fi is off", L"Wi-Fi kapalı")) : std::wstring(st.scanning ? i18n::Pick(L"Searching for networks...", L"Ağlar aranıyor...") : i18n::Pick(L"No networks found", L"Ağ bulunamadı"));
+            const std::wstring t2 = noAdapter ? std::wstring(m_eth ? i18n::Pick(L"This PC uses a wired connection.", L"Bu bilgisayar kablolu bağlantı kullanıyor.") : i18n::Pick(L"This PC has no wireless card.", L"Bu bilgisayarda kablosuz ağ kartı yok."))
+                                  : off ? std::wstring(m_eth ? i18n::Pick(L"Your wired connection works. Turn Wi-Fi on to see wireless networks.", L"Kablolu bağlantın çalışıyor. Kablosuz ağları görmek için Wi-Fi'yi aç.") : i18n::Pick(L"Turn Wi-Fi on to see networks.", L"Ağları görmek için Wi-Fi'yi aç."))
+                                        : std::wstring(i18n::Pick(L"Nearby networks appear here.", L"Yakındaki ağlar burada görünür."));
+            Text(c, t1, m_fCTitle.Get(), Rect{P.x + 10 * s, cy + 42 * s, P.width - 20 * s, 26 * s}, W(0.92f));
+            Text(c, t2, m_fCSmall.Get(), Rect{P.x + 34 * s, cy + 70 * s, P.width - 68 * s, 40 * s}, W(0.55f));
+            if (off) {
+                Rect b{cx - 76 * s, cy + 118 * s, 152 * s, 38 * s};
+                Fill(c, b, 19 * s, Color{acc.r, acc.g, acc.b, b.Contains(m_mouse) ? 1.0f : 0.88f}); AddHit(b, 1);
+                Text(c, i18n::Pick(L"Turn Wi-Fi on", L"Wi-Fi'yi aç"), m_fCenter.Get(), b, W(1.0f));
+            }
+        }
+    }
     float y = viewTop - m_scroll;
     for (size_t i = 0; i < st.nets.size(); ++i) {
         const auto& n = st.nets[i];
@@ -613,6 +737,11 @@ void NetPanel::OnDraw(ID2D1DeviceContext* c, const Rect& P) {
             Text(c, n.ssid, m_fBody.Get(), Rect{r.x + 50 * s, r.y + 8 * s, r.width - 110 * s, 22 * s}, W(0.97f));
             std::wstring sub = n.connected ? std::wstring(i18n::Pick(L"Connected", L"Bağlı")) : (n.known ? std::wstring(i18n::Pick(L"Saved", L"Kayıtlı")) : (n.secure ? std::wstring(i18n::Pick(L"Secured", L"Korumalı")) : std::wstring(i18n::Pick(L"Open", L"Açık"))));
             Text(c, sub, m_fSmall.Get(), Rect{r.x + 50 * s, r.y + 28 * s, r.width - 110 * s, 20 * s}, n.connected ? acc : W(0.5f));
+            if (hot && !n.connected && !sel) {                           // connect pill appears on hover
+                Rect cp{r.Right() - 118 * s, r.y + 14 * s, 74 * s, 26 * s};
+                Fill(c, cp, 13 * s, Color{acc.r, acc.g, acc.b, 0.85f});
+                Text(c, i18n::Pick(L"Connect", L"Bağlan"), m_fCenter.Get(), cp, W(1.0f));
+            }
             if (n.secure && !n.connected) Glyph(c, gl::kGlyphLock, Rect{r.Right() - 44 * s, r.y, 30 * s, rowH}, W(0.5f));
             if (n.connected) Glyph(c, gl::kGlyphCheck, Rect{r.Right() - 44 * s, r.y, 30 * s, rowH}, acc);
             if (r.y + rowH > viewTop && r.y < viewBottom) AddHit(Rect{r.x, std::max(r.y, viewTop), r.width, rowH}, 100 + static_cast<int>(i));
@@ -647,13 +776,17 @@ void NetPanel::OnDraw(ID2D1DeviceContext* c, const Rect& P) {
         c->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x + ph * (w - 80 * s), viewBottom + 2 * s, x + ph * (w - 80 * s) + 80 * s, viewBottom + 5 * s), 1.5f * s, 1.5f * s), m_brush.Get());
     }
 
-    // footer buttons
-    const float fy = P.Bottom() - 54 * s, bw = (w - 8 * s) / 2;
-    Rect b1{x, fy, bw, 38 * s}, b2{x + bw + 8 * s, fy, bw, 38 * s};
-    Fill(c, b1, 19 * s, b1.Contains(m_mouse) ? W(0.14f) : W(0.07f)); AddHit(b1, 3);
-    Text(c, i18n::Pick(L"Network settings", L"Ağ ayarları"), m_fCenter.Get(), b1, W(0.88f));
-    Fill(c, b2, 19 * s, b2.Contains(m_mouse) ? W(0.14f) : W(0.07f)); AddHit(b2, 4);
-    Text(c, i18n::Pick(L"Airplane mode", L"Uçak modu"), m_fCenter.Get(), b2, W(0.88f));
+    // footer: three shortcuts with icons
+    const float fy = P.Bottom() - 54 * s, gp = 8 * s, bw = (w - 2 * gp) / 3;
+    struct Btn { int id; wchar_t glyph; const wchar_t* en; const wchar_t* tr; };
+    const Btn btns[3] = {{3, gl::kGlyphSettings, L"Settings", L"Ayarlar"}, {9, gl::kGlyphEthernet, L"Adapters", L"Bağdaştırıcılar"}, {4, static_cast<wchar_t>(0xE709), L"Airplane", L"Uçak modu"}};
+    for (int i = 0; i < 3; ++i) {
+        Rect b{x + i * (bw + gp), fy, bw, 38 * s};
+        const bool hov = b.Contains(m_mouse);
+        Fill(c, b, 19 * s, hov ? W(0.14f) : W(0.07f)); AddHit(b, btns[i].id);
+        Glyph(c, btns[i].glyph, Rect{b.x + 8 * s, b.y, 26 * s, b.height}, W(hov ? 0.95f : 0.7f));
+        Text(c, i18n::Pick(btns[i].en, btns[i].tr), m_fSmall.Get(), Rect{b.x + 36 * s, b.y, b.width - 38 * s, b.height}, W(hov ? 0.95f : 0.85f));
+    }
 }
 
 } // namespace aether::bar

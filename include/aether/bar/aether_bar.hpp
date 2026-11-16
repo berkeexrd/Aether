@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <wrl/client.h>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -12,6 +13,8 @@
 #include "aether/render/backdrop.hpp"
 
 namespace aether::bar {
+
+class WindowPreview;
 
 using Microsoft::WRL::ComPtr;
 class StartMenu;
@@ -33,6 +36,11 @@ private:
     bool m_hard{false};
 };
 
+// Pins an app / file / folder to the dock (Start menu "Pin to bar"). Returns false when it is already pinned.
+bool PinToBar(const std::wstring& path);
+bool IsPinnedToBar(const std::wstring& path);
+void UnpinFromBar(const std::wstring& path);
+
 // One button in the dock = one application (its windows on this monitor are grouped).
 struct Entry {
     std::wstring key;
@@ -43,6 +51,8 @@ struct Entry {
     ComPtr<ID2D1Bitmap1> icon;
     ULONGLONG iconStamp{0};
     int cycle{0};
+    float slide{0.0f};                 // px: eases to 0 after a drag re-order, so the buttons glide into their new slots
+    ULONGLONG launchTick{0};           // last time a click launched this app (guards against double launches)
     animation::Spring<float> appear;
     animation::Spring<float> hover;
     animation::Spring<float> active;
@@ -95,11 +105,26 @@ private:
     void ShowItemMenu(int index);
     void ShowBarMenu();
     void ActivateWindow(HWND hwnd);
+    void LaunchEntry(Entry& e);
+    std::vector<HWND> WindowsOfEntryEverywhere(const Entry& e);
+    void BeginDrag();
+    void UpdateDrag();
+    void ApplyDropIndex(int target);
+    void EndDrag(bool commit);
+    // pinning by dropping items from the desktop / Explorer (messages from other processes, see bar_pin_msg.hpp)
+    int PinSlotAt(float screenX) const;                       // insertion index among the pinned buttons
+    void OnPinHover(int sx, int sy);
+    void AddPins(const std::vector<std::wstring>& paths, int screenX);
     void AdjustVolume(float delta);
     void ToggleFlyout(Flyout* panel, const core::Rect& anchor);
 
     void ComputeLayout();
     void ComputeTooltip();
+    void UpdatePreview(float dt);
+    void SyncEdge(float dt);                    // follow the taskbar position set in Windows
+    void ApplyEdge(bool top);
+    [[nodiscard]] float LiftPx() const;         // appear-animation offset, signed for the bar edge
+    void HidePreview();
     void UpdateRegion();
     void Render();
     void DrawPill(ID2D1DeviceContext* ctx, const core::Rect& r, float radius);
@@ -127,7 +152,25 @@ private:
     float m_hoverAmt[16]{};                    // eased hover amount per Hit kind (system pill highlights)
 
     std::vector<std::unique_ptr<Entry>> m_entries;
+    unsigned m_packVer{0};                                       // icon pack version the cached icons were loaded for
+    std::map<std::wstring, ComPtr<ID2D1Bitmap1>> m_iconCache;   // one bitmap per app, shared by every button / window of it
+    // drag & drop re-ordering of the buttons
+    int m_downIdx{-1};                 // button the left mouse button went down on
+    core::Vec2 m_downPt{0.0f, 0.0f};
+    bool m_dragging{false};
+    // hover preview of an app's windows
+    bool m_top{false};                 // dock sits on the top edge (Windows taskbar position)
+    float m_edgeTimer{0.0f};
+    std::unique_ptr<WindowPreview> m_preview;
+    int m_prevItem{-1};
+    float m_hoverDwell{0.0f}, m_leaveDwell{0.0f}, m_prevSync{0.0f};
+    std::wstring m_prevKey;
+    int m_dragIdx{-1}, m_dropIdx{-1};
     unsigned m_pinVersion{0};
+    ULONGLONG m_pinHoverTick{0};       // a drag carrying items was over the bar this recently
+    float m_pinHoverAmt{0.0f};         // eased 0..1: dock highlight + insertion line
+    int m_pinSlot{0};
+    float m_pinLineX{0.0f};
     LayoutInfo m_layout;
     animation::Spring<float> m_startHover;
     animation::Spring<float> m_dockAppear;

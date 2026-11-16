@@ -4,6 +4,8 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 #include "aether/ui/settings_pages.hpp"
+#include <string>
+#include <vector>
 
 namespace aether::ui {
 
@@ -18,11 +20,17 @@ public:
 
     bool Create();
     void Show(bool show = true);
+    void ShowTab(SettingsTab tab);          // opens the window on a given page (used by "--settings desktop" and the desktop's own Aether icon)
     [[nodiscard]] bool IsVisible() const { return m_visible; }
+    // True once the window has been left alone for a couple of seconds (no mouse, keyboard, resize or show request).
+    // The main loop then redraws it at a relaxed rate instead of at the monitor's refresh rate.
+    [[nodiscard]] static bool IsIdle();
+    static void NoteActivity();
     void Render();
     void Destroy();
 
     [[nodiscard]] HWND GetHwnd() const { return m_hwnd; }
+    [[nodiscard]] ID3D11Device* Device() const { return m_pd3dDevice.Get(); }   // for pages that upload small textures (desktop preview)
 
 private:
     SettingsWindow() = default;
@@ -47,6 +55,21 @@ private:
     ComPtr<ID3D11RenderTargetView> m_mainRenderTargetView;
 
     SettingsTab m_activeTab{SettingsTab::General};
+
+    // feature search (sidebar box): results replace the page while a query is typed
+    char m_query[96]{};
+    bool m_focusSearch{false};
+    bool m_enterPressed{false};
+    float m_searchBoxBottom{0.0f};
+    bool m_indexBuilt{false};
+    bool m_indexTurkish{false};
+    std::vector<UI::SearchEntry> m_index;
+    std::vector<std::wstring> m_foldLabel, m_foldAll;      // folded copies of the index, parallel to m_index
+    std::string m_lastQuery;
+    std::vector<int> m_hits;                                // indices into m_index, best first
+    void BuildSearchIndex();
+    void UpdateSearchHits();
+    void RenderSearchResults();
 };
 
 } // namespace aether::ui

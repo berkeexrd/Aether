@@ -12,6 +12,7 @@
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <chrono>
+#include "aether/core/crash.hpp"
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -39,7 +40,7 @@ void MetricsCollector::Start(uint32_t intervalMs) {
         m_metrics.gpuHistory.assign(30, 0.0f);
     }
 
-    m_workerThread = std::thread(&MetricsCollector::WorkerLoop, this);
+    m_workerThread = ::aether::core::SafeThread("metrics", [this] { WorkerLoop(); });
     AETHER_LOG_INFO("MetricsCollector started with interval " << intervalMs << "ms");
 }
 

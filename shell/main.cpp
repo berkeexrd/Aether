@@ -15,6 +15,7 @@
 #include <dwmapi.h>
 #include <psapi.h>
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <string>
 #include <thread>
@@ -22,6 +23,10 @@
 #include "aether/render/dcomp_layer.hpp"
 #include "aether/render/glass.hpp"
 #include "aether/render/mini_gfx.hpp"
+#include "aether/system/app_identity.hpp"
+#include "aether/system/shell_keys.hpp"
+#include "aether/system/icon_pack.hpp"
+#include "aether/core/crash.hpp"
 
 using namespace aether;
 using aether::mg::Color;
@@ -33,12 +38,13 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr UINT kMsgSwStart = WM_APP + 1, kMsgSwNext = WM_APP + 2, kMsgSwMove = WM_APP + 3, kMsgSwCommit = WM_APP + 4, kMsgSwCancel = WM_APP + 5;
-constexpr UINT kMsgRun = WM_APP + 6, kMsgMinAll = WM_APP + 7, kMsgSettings = WM_APP + 8;
+using shellkeys::kMsgSwStart; using shellkeys::kMsgSwNext; using shellkeys::kMsgSwMove; using shellkeys::kMsgSwCommit; using shellkeys::kMsgSwCancel;
+using shellkeys::kMsgRun; using shellkeys::kMsgMinAll; using shellkeys::kMsgSettings; using shellkeys::kMsgWinCombo;
+using shellkeys::g_swActive;
+using shellkeys::MaskKeys;
 constexpr UINT_PTR kTimerSupervise = 1;
 
 HWND g_ctl = nullptr;
-bool g_swActive = false, g_swSticky = false;
 
 std::wstring ExeDir() {
     wchar_t p[MAX_PATH] = {}; GetModuleFileNameW(nullptr, p, MAX_PATH);
@@ -61,14 +67,6 @@ void ForceForeground(HWND h) {
     BringWindowToTop(h);
     SetForegroundWindow(h);
     if (fg && fg != me) AttachThreadInput(me, fg, FALSE);
-}
-
-void MaskKeys() {                                    // dummy key: stops Start / the menu bar from reacting to a lone Win / Alt release
-    INPUT in[2] = {};
-    in[0].type = in[1].type = INPUT_KEYBOARD;
-    in[0].ki.wVk = in[1].ki.wVk = 0xE8;
-    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(2, in, sizeof(INPUT));
 }
 
 std::wstring ProcessPath(HWND h) {
@@ -110,6 +108,10 @@ void Activate(HWND h) {
     if (!h || !IsWindow(h)) return;
     if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
     ForceForeground(h);
+    // An elevated window cannot be taken to the front by a non-elevated process: the (elevated) bar does it for us.
+    if (GetForegroundWindow() != h && GetAncestor(GetForegroundWindow(), GA_ROOTOWNER) != h) {
+        if (HWND bar = FindWindowW(L"AetherBarClass", nullptr)) PostMessageW(bar, shellkeys::kMsgActivate, reinterpret_cast<WPARAM>(h), 0);
+    }
 }
 
 HMONITOR WorkMonitor() {
@@ -138,6 +140,7 @@ private:
     std::unique_ptr<render::DCompLayer> m_dc;
     mg::Gfx m_g;
     std::vector<Entry> m_items;
+    unsigned m_packVer{0};
     std::map<std::wstring, ComPtr<ID2D1Bitmap1>> m_iconCache;
     int m_sel{0}, m_hover{-1};
     bool m_active{false}, m_shown{false}, m_sticky{false};
@@ -183,15 +186,20 @@ bool Switcher::EnsureWindow() {
 
 ComPtr<ID2D1Bitmap1> Switcher::IconFor(HWND h) {
     auto* ctx = m_dc->GetContext();
+    { const unsigned pv = aether::system::iconpack::Version(); if (pv != m_packVer) { m_packVer = pv; m_iconCache.clear(); } }   // new icon pack chosen
     const std::wstring path = ProcessPath(h);
     const bool frame = path.empty() || StrStrIW(path.c_str(), L"ApplicationFrameHost") != nullptr;
-    if (!frame) {
-        auto it = m_iconCache.find(path);
-        if (it != m_iconCache.end()) return it->second;
+    // Store / UWP apps (Settings, Calculator ...) live in ApplicationFrameHost: their real tile icon comes through the AppUserModelID.
+    std::wstring src = path;
+    if (frame) { const std::wstring aumid = aether::system::WindowAumid(h); src = aumid.empty() ? std::wstring() : aether::system::AppsFolderPath(aumid); }
+    if (!src.empty()) {
+        auto it = m_iconCache.find(src);
+        if (it != m_iconCache.end() && it->second) return it->second;
         int w = 0, hh = 0; std::vector<uint32_t> px;
         ComPtr<ID2D1Bitmap1> bmp;
-        if (mg::ShellImage(path, 96, false, w, hh, px)) bmp = mg::BitmapFromPixels(ctx, px, w, hh);
-        m_iconCache[path] = bmp;
+        if (aether::system::iconpack::Active()) { const std::wstring f = aether::system::iconpack::Find(src); if (!f.empty()) bmp = aether::system::iconpack::LoadBitmap(ctx, f); }
+        if (!bmp && mg::ShellImage(src, 96, false, w, hh, px)) bmp = mg::BitmapFromPixels(ctx, px, w, hh);
+        m_iconCache[src] = bmp;
         if (bmp) return bmp;
     }
     DWORD_PTR r = 0; HICON ic = nullptr;
@@ -406,7 +414,10 @@ private:
     int m_histPos{-1};
     float m_scale{1.0f};
     bool m_ok{false};
-    static constexpr float kW = 580.0f, kH = 176.0f;
+    bool m_admin{false};          // run the command elevated ("runas")
+    bool m_selAll{false};         // Ctrl+A: the whole text is selected
+    static constexpr float kW = 580.0f, kH = 206.0f;
+    Rect AdminRect() const { return Rect{30.0f, 10.0f + 106.0f, 300.0f, 28.0f}; }
 
     bool EnsureWindow();
     void Render();
@@ -414,7 +425,12 @@ private:
     void LoadHist();
     void SaveHist();
     LRESULT Handle(UINT m, WPARAM w, LPARAM l);
-    void Insert(const std::wstring& s) { m_text.insert(m_caret, s); m_caret += s.size(); m_err.clear(); }
+    void Insert(const std::wstring& s) {
+        if (m_selAll) { m_text.clear(); m_caret = 0; m_selAll = false; }
+        m_text.insert(m_caret, s); m_caret += s.size(); m_err.clear();
+    }
+    bool EraseSelection() { if (!m_selAll) return false; m_text.clear(); m_caret = 0; m_selAll = false; m_err.clear(); return true; }
+    void CopyText();
 };
 RunBox g_run;
 
@@ -452,17 +468,17 @@ bool RunBox::EnsureWindow() {
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"AetherRunWindow"; wc.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
     RegisterClassExW(&wc);
-    m_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP, L"AetherRunWindow", L"Çalıştır", WS_POPUP, 0, 0, 600, 200, nullptr, nullptr, GetModuleHandleW(nullptr), this);
+    m_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP, L"AetherRunWindow", L"Çalıştır", WS_POPUP, 0, 0, 600, 230, nullptr, nullptr, GetModuleHandleW(nullptr), this);
     if (!m_hwnd) return false;
     m_dc = std::make_unique<render::DCompLayer>();
-    if (!m_dc->Initialize(m_hwnd, 600, 200)) { DestroyWindow(m_hwnd); m_hwnd = nullptr; return false; }
+    if (!m_dc->Initialize(m_hwnd, 600, 230)) { DestroyWindow(m_hwnd); m_hwnd = nullptr; return false; }
     m_g.Init(m_dc.get());
     return true;
 }
 
 void RunBox::Open() {
     if (!EnsureWindow()) return;
-    LoadHist(); m_text.clear(); m_caret = 0; m_err.clear(); m_histPos = -1;
+    LoadHist(); m_text.clear(); m_caret = 0; m_err.clear(); m_histPos = -1; m_admin = false; m_selAll = false;
     MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(WorkMonitor(), &mi);
     SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 100, 100, SWP_NOACTIVATE | SWP_NOMOVE | SWP_HIDEWINDOW);
     SetWindowPos(m_hwnd, HWND_TOPMOST, mi.rcWork.left, mi.rcWork.top, 100, 100, SWP_NOACTIVATE | SWP_NOSIZE);
@@ -494,13 +510,29 @@ void RunBox::Render() {
     m_g.StrokeRR(field, 12, WithA(vl, 0.75f), 1.4f);
     const Rect tx{field.x + 14, field.y, field.width - 28, field.height};
     if (m_text.empty()) m_g.Text(L"Program, klasör, belge veya web adresi yazın", tx, 14.0f, 400, WithA(kWhite, 0.38f));
-    else m_g.Text(m_text, tx, 15.0f, 400, kWhite);
-    if ((GetTickCount64() / 500) % 2 == 0 || true) {
+    else {
+        if (m_selAll) {                                                    // selection highlight behind the text
+            const float tw = m_g.TextWidth(m_text, 15.0f, 400);
+            m_g.FillRR(Rect{tx.x - 2, field.y + 9, tw + 4, 26}, 5, WithA(vl, 0.45f));
+        }
+        m_g.Text(m_text, tx, 15.0f, 400, kWhite);
+    }
+    if (!m_selAll) {
         const float cx = m_g.TextWidth(m_text.substr(0, m_caret), 15.0f, 400);
         m_g.FillRR(Rect{tx.x + cx + 0.5f, field.y + 11, 1.6f, 22}, 0.8f, kWhite);
     }
-    if (!m_err.empty()) m_g.Text(m_err, Rect{panel.x + 22, panel.y + 106, panel.width - 44, 24}, 12.5f, 400, Color{1.0f, 0.55f, 0.55f, 1.0f});
-    else m_g.Text(L"Enter: çalıştır      Esc: kapat      ↑ ↓: geçmiş", Rect{panel.x + 22, panel.y + 106, panel.width - 44, 24}, 12.0f, 400, WithA(kWhite, 0.45f));
+    // "run as administrator": a check box (click) that Ctrl+Shift+Enter also does in one go
+    {
+        const Rect ar{panel.x + 20, panel.y + 106, 300, 28};
+        const Rect box{ar.x, ar.y + 4, 20, 20};
+        m_g.FillRR(box, 6, m_admin ? WithA(vl, 0.95f) : Color{0.0f, 0.0f, 0.0f, 0.38f});
+        m_g.StrokeRR(box, 6, WithA(vl, m_admin ? 1.0f : 0.6f), 1.2f);
+        if (m_admin) m_g.Glyph(0xE73E, box, 13.0f, Color{0.05f, 0.03f, 0.12f, 1.0f});
+        m_g.Text(L"Yönetici olarak çalıştır", Rect{ar.x + 30, ar.y, 220, 28}, 13.5f, 500, WithA(kWhite, m_admin ? 1.0f : 0.78f));
+        m_g.Text(L"Ctrl+Shift+Enter", Rect{panel.x + panel.width - 160, ar.y, 140, 28}, 11.5f, 400, WithA(kWhite, 0.38f), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+    if (!m_err.empty()) m_g.Text(m_err, Rect{panel.x + 22, panel.y + 140, panel.width - 44, 24}, 12.5f, 400, Color{1.0f, 0.55f, 0.55f, 1.0f});
+    else m_g.Text(L"Enter: çalıştır      Esc: kapat      ↑ ↓: geçmiş", Rect{panel.x + 22, panel.y + 140, panel.width - 44, 24}, 12.0f, 400, WithA(kWhite, 0.45f));
     m_g.End();
 }
 
@@ -525,20 +557,39 @@ void RunBox::Execute() {
     }
     while (!args.empty() && args.front() == L' ') args.erase(0, 1);
     bool ok = false;
+    const wchar_t* verb = m_admin ? L"runas" : L"open";
+    INT_PTR rc = 0;
+    SetLastError(0);
     if (DirExists(file)) {                                        // folders open in Aether Explorer
         const std::wstring ae = ExeDir() + L"\\AetherExplorer.exe";
         const std::wstring a = L"\"" + file + L"\"";
         ok = FileExists(ae) ? reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", ae.c_str(), a.c_str(), nullptr, SW_SHOWNORMAL)) > 32
                             : reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", file.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32;
     } else {
-        ok = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", file.c_str(), args.empty() ? nullptr : args.c_str(), nullptr, SW_SHOWNORMAL)) > 32;
+        rc = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, verb, file.c_str(), args.empty() ? nullptr : args.c_str(), nullptr, SW_SHOWNORMAL));
+        ok = rc > 32;
     }
-    if (!ok) { m_err = L"“" + file + L"” bulunamadı. Adı doğru yazdığınızdan emin olun."; Render(); return; }
+    if (!ok) {
+        const bool declined = m_admin && (rc == SE_ERR_ACCESSDENIED || GetLastError() == ERROR_CANCELLED);
+        m_err = declined ? std::wstring(L"Yönetici izni verilmedi.") : L"“" + file + L"” bulunamadı. Adı doğru yazdığınızdan emin olun.";
+        Render(); return;
+    }
     m_hist.erase(std::remove(m_hist.begin(), m_hist.end(), cmd), m_hist.end());
     m_hist.insert(m_hist.begin(), cmd);
     if (m_hist.size() > 20) m_hist.resize(20);
     SaveHist();
     ShowWindow(m_hwnd, SW_HIDE);
+}
+
+void RunBox::CopyText() {
+    if (m_text.empty() || !OpenClipboard(m_hwnd)) return;
+    EmptyClipboard();
+    const size_t bytes = (m_text.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* p = GlobalLock(g)) { memcpy(p, m_text.c_str(), bytes); GlobalUnlock(g); SetClipboardData(CF_UNICODETEXT, g); }
+        else GlobalFree(g);
+    }
+    CloseClipboard();
 }
 
 LRESULT CALLBACK RunBox::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -557,15 +608,16 @@ LRESULT RunBox::Handle(UINT m, WPARAM w, LPARAM l) {
     case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(m_hwnd, &ps); EndPaint(m_hwnd, &ps); Render(); return 0; }
     case WM_KILLFOCUS: if (IsWindowVisible(m_hwnd)) ShowWindow(m_hwnd, SW_HIDE); return 0;
     case WM_KEYDOWN: {
-        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         switch (w) {
             case VK_ESCAPE: ShowWindow(m_hwnd, SW_HIDE); return 0;
-            case VK_RETURN: Execute(); return 0;
-            case VK_LEFT: if (m_caret) --m_caret; break;
-            case VK_RIGHT: if (m_caret < m_text.size()) ++m_caret; break;
-            case VK_HOME: m_caret = 0; break;
-            case VK_END: m_caret = m_text.size(); break;
-            case VK_DELETE: if (m_caret < m_text.size()) { m_text.erase(m_caret, 1); m_err.clear(); } break;
+            case VK_RETURN: if (ctrl && shift) m_admin = true; Execute(); return 0;          // Ctrl+Shift+Enter: as administrator, like Windows' own box
+            case VK_TAB: m_admin = !m_admin; break;
+            case VK_LEFT: m_selAll = false; if (m_caret) --m_caret; break;
+            case VK_RIGHT: m_selAll = false; if (m_caret < m_text.size()) ++m_caret; break;
+            case VK_HOME: m_selAll = false; m_caret = 0; break;
+            case VK_END: m_selAll = false; m_caret = m_text.size(); break;
+            case VK_DELETE: if (!EraseSelection() && m_caret < m_text.size()) { m_text.erase(m_caret, 1); m_err.clear(); } break;
             case VK_UP: if (m_histPos + 1 < static_cast<int>(m_hist.size())) { m_text = m_hist[++m_histPos]; m_caret = m_text.size(); m_err.clear(); } break;
             case VK_DOWN:
                 if (m_histPos > 0) { m_text = m_hist[--m_histPos]; m_caret = m_text.size(); }
@@ -583,16 +635,34 @@ LRESULT RunBox::Handle(UINT m, WPARAM w, LPARAM l) {
                     CloseClipboard();
                 }
                 break;
-            case 'A': if (ctrl) m_caret = m_text.size(); break;
+            case 'A': if (ctrl) { m_selAll = !m_text.empty(); m_caret = m_text.size(); } break;
+            case 'C': if (ctrl) CopyText(); break;
+            case 'X': if (ctrl) { CopyText(); EraseSelection(); } break;
         }
         Render();
         return 0;
     }
     case WM_CHAR:
-        if (w == 8) { if (m_caret) { m_text.erase(--m_caret, 1); m_err.clear(); } }
-        else if (w >= 32 && w != 127) Insert(std::wstring(1, static_cast<wchar_t>(w)));
+        if (w == 8) {                                                      // Backspace, Ctrl+Backspace deletes a word
+            if (!EraseSelection() && m_caret) {
+                if (GetKeyState(VK_CONTROL) & 0x8000) {
+                    size_t b = m_caret;
+                    while (b > 0 && iswspace(m_text[b - 1])) --b;
+                    while (b > 0 && !iswspace(m_text[b - 1])) --b;
+                    m_text.erase(b, m_caret - b); m_caret = b;
+                } else m_text.erase(--m_caret, 1);
+                m_err.clear();
+            }
+        }
+        else if (w == 127 || w == 1 || w == 3 || w == 24 || w == 9 || w == 13 || w == 27) {}      // control characters produced by Ctrl+key / Tab / Enter / Esc
+        else if (w >= 32) Insert(std::wstring(1, static_cast<wchar_t>(w)));
         Render();
         return 0;
+    case WM_LBUTTONDOWN: {
+        const float x = GET_X_LPARAM(l) / m_scale, y = GET_Y_LPARAM(l) / m_scale;
+        if (AdminRect().Contains(x, y)) { m_admin = !m_admin; Render(); }
+        return 0;
+    }
     }
     return DefWindowProcW(m_hwnd, m, w, l);
 }
@@ -600,44 +670,45 @@ LRESULT RunBox::Handle(UINT m, WPARAM w, LPARAM l) {
 // =============================================================================================================================
 //   the global keyboard hook
 // =============================================================================================================================
+// The hook lives on a thread of its own that does nothing else. A low-level hook has to answer within ~300 ms; on the main
+// thread (window painting, icon loading, Sleep) it sometimes did not, and Windows then removes such a hook SILENTLY: from that
+// moment on Windows' own Alt+Tab / Win+R came up again. The thread also puts a fresh hook in place every few seconds in case
+// the system dropped it anyway.
 HHOOK g_hook = nullptr;
+DWORD g_hookThreadId = 0;
+HANDLE g_hookThread = nullptr;
+
+bool PostToShell(UINT m, WPARAM w, LPARAM l) { return g_ctl && PostMessageW(g_ctl, m, w, l) != 0; }
 
 LRESULT CALLBACK KeyHook(int n, WPARAM w, LPARAM l) {
-    if (n != HC_ACTION) return CallNextHookEx(nullptr, n, w, l);
-    const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(l);
-    if (k->flags & LLKHF_INJECTED) return CallNextHookEx(nullptr, n, w, l);
-    const bool down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
-    const DWORD vk = k->vkCode;
-    auto pressed = [](int v) { return (GetAsyncKeyState(v) & 0x8000) != 0; };
-    const bool alt = (k->flags & LLKHF_ALTDOWN) != 0, win = pressed(VK_LWIN) || pressed(VK_RWIN), ctrl = pressed(VK_CONTROL), shift = pressed(VK_SHIFT);
-
-    if (g_swActive) {
-        if (vk == VK_TAB) { if (down) PostMessageW(g_ctl, kMsgSwNext, shift ? static_cast<WPARAM>(-1) : 1, 0); return 1; }
-        if (vk == VK_ESCAPE) { if (down) PostMessageW(g_ctl, kMsgSwCancel, 0, 0); return 1; }
-        if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN) { if (down) PostMessageW(g_ctl, kMsgSwMove, vk, 0); return 1; }
-        if (g_swSticky && (vk == VK_RETURN || vk == VK_SPACE)) { if (down) PostMessageW(g_ctl, kMsgSwCommit, 0, 0); return 1; }
-        if (!g_swSticky && !down && (vk == VK_LMENU || vk == VK_RMENU || vk == VK_MENU)) {       // Alt released: switch
-            g_swActive = false;
-            PostMessageW(g_ctl, kMsgSwCommit, 0, 0);
-            MaskKeys();
-        }
-        return CallNextHookEx(nullptr, n, w, l);
-    }
-    if (down && vk == VK_TAB && alt && !ctrl && !win) {
-        g_swActive = true; g_swSticky = false;
-        PostMessageW(g_ctl, kMsgSwStart, 0, shift ? 1 : 0);
-        return 1;
-    }
-    if (vk == VK_TAB && win && !ctrl && !alt) {
-        if (down) { g_swActive = true; g_swSticky = true; MaskKeys(); PostMessageW(g_ctl, kMsgSwStart, 1, shift ? 1 : 0); }
-        return 1;
-    }
-    if (win && !ctrl && !alt) {
-        if (vk == 'R') { if (down) { MaskKeys(); PostMessageW(g_ctl, kMsgRun, 0, 0); } return 1; }
-        if (vk == 'M') { if (down) { MaskKeys(); PostMessageW(g_ctl, kMsgMinAll, shift ? 1 : 0, 0); } return 1; }
-        if (vk == 'I') { if (down) { MaskKeys(); PostMessageW(g_ctl, kMsgSettings, 0, 0); } return 1; }
-    }
+    if (n == HC_ACTION && shellkeys::Route(reinterpret_cast<const KBDLLHOOKSTRUCT*>(l), w, PostToShell, nullptr)) return 1;
     return CallNextHookEx(nullptr, n, w, l);
+}
+
+DWORD WINAPI HookThread(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    MSG msg;
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);              // create the thread's message queue
+    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, GetModuleHandleW(nullptr), 0);
+    SetTimer(nullptr, 1, 4000, nullptr);
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message != WM_TIMER) continue;
+        if (shellkeys::g_swActive) continue;                                 // never swap the hook in the middle of a sequence
+        if (HHOOK fresh = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, GetModuleHandleW(nullptr), 0)) {
+            if (g_hook) UnhookWindowsHookEx(g_hook);
+            g_hook = fresh;
+        }
+    }
+    if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
+    return 0;
+}
+
+void StartKeyHook() { g_hookThread = CreateThread(nullptr, 0, HookThread, nullptr, 0, &g_hookThreadId); }
+void StopKeyHook() {
+    if (!g_hookThread) return;
+    PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
+    WaitForSingleObject(g_hookThread, 2000);
+    CloseHandle(g_hookThread); g_hookThread = nullptr;
 }
 
 // =============================================================================================================================
@@ -649,17 +720,40 @@ struct Proc {
     HANDLE h{nullptr};
     int crashes{0};
     ULONGLONG windowStart{0};
+    ULONGLONG restartAt{0};
 };
 std::vector<Proc> g_procs;
 bool g_realShell = false, g_fallbackStarted = false;
 std::vector<HWND> g_minimized;
+
+// AetherBar.exe asks for administrator rights; a non-elevated process cannot start it directly. The autostart option creates a
+// highest-privilege task for it, which can be run without a UAC prompt.
+bool StartViaTask(const std::wstring& exe) {
+    const size_t k = exe.find_last_of(L"\\/");
+    std::wstring name = k == std::wstring::npos ? exe : exe.substr(k + 1);
+    const size_t dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos) name.resize(dot);
+    wchar_t sys[MAX_PATH]; GetSystemDirectoryW(sys, MAX_PATH);
+    const std::wstring tool = std::wstring(sys) + L"\\schtasks.exe";
+    std::wstring cl = L"\"" + tool + L"\" /Run /TN \"" + name + L"\"";
+    STARTUPINFOW si = {sizeof(si)}; PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(tool.c_str(), cl.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
+    CloseHandle(pi.hThread);
+    DWORD code = 1;
+    if (WaitForSingleObject(pi.hProcess, 4000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    return code == 0;
+}
 
 bool StartProc(Proc& p) {
     if (!FileExists(p.exe)) return false;
     STARTUPINFOW si = {sizeof(si)}; PROCESS_INFORMATION pi = {};
     std::wstring cl = L"\"" + p.exe + L"\"";
     const std::wstring dir = ExeDir();
-    if (!CreateProcessW(p.exe.c_str(), cl.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi)) return false;
+    if (!CreateProcessW(p.exe.c_str(), cl.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi)) {
+        if (GetLastError() == ERROR_ELEVATION_REQUIRED) return StartViaTask(p.exe);
+        return false;
+    }
     CloseHandle(pi.hThread);
     if (p.h) CloseHandle(p.h);
     p.h = pi.hProcess;
@@ -679,7 +773,13 @@ void StartExplorerFallback() {
 void Supervise() {
     const ULONGLONG now = GetTickCount64();
     for (auto& p : g_procs) {
-        if (!p.h) continue;
+        if (!p.h) {
+            if (p.restartAt && now >= p.restartAt) {                // a delayed restart (never Sleep here: the main thread must stay responsive)
+                p.restartAt = 0;
+                if (!StartProc(p) && p.required && g_realShell) StartExplorerFallback();
+            }
+            continue;
+        }
         if (WaitForSingleObject(p.h, 0) != WAIT_OBJECT_0) continue;
         DWORD code = 0; GetExitCodeProcess(p.h, &code);
         CloseHandle(p.h); p.h = nullptr;
@@ -689,8 +789,7 @@ void Supervise() {
             if (p.required && g_realShell) StartExplorerFallback();
             continue;
         }
-        Sleep(400);
-        StartProc(p);
+        p.restartAt = now + 400;
     }
 }
 
@@ -790,6 +889,9 @@ LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case kMsgRun: g_run.Open(); return 0;
     case kMsgMinAll: MinimizeAll(w != 0); return 0;
     case kMsgSettings: ShellExecuteW(nullptr, L"open", L"ms-settings:", nullptr, nullptr, SW_SHOWNORMAL); return 0;
+    case kMsgWinCombo:                                              // the bar must not open Start when the Win key is released
+        if (HWND bar = FindWindowW(L"AetherBarClass", nullptr)) PostMessageW(bar, kMsgWinCombo, 0, 0);
+        return 0;
     case WM_TIMER: if (w == kTimerSupervise) Supervise(); return 0;
     case WM_ENDSESSION: return 0;
     }
@@ -799,6 +901,7 @@ LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+    aether::core::InstallCrashHandler(L"AetherShell");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     HANDLE once = CreateMutexW(nullptr, TRUE, L"Aether.Shell.SingleInstance");
     if (once && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
@@ -812,7 +915,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
 
     WNDCLASSEXW wc = {sizeof(wc)};
-    wc.lpfnWndProc = CtlProc; wc.hInstance = inst; wc.lpszClassName = L"AetherShellControl";
+    wc.lpfnWndProc = CtlProc; wc.hInstance = inst; wc.lpszClassName = shellkeys::kCtlClass;
     RegisterClassExW(&wc);
     g_ctl = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, nullptr);
     if (!g_ctl) return 1;
@@ -835,11 +938,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         else if (p.required && g_realShell) StartExplorerFallback();   // no bar = no usable desktop: fall back to Windows' own
     }
     SetTimer(g_ctl, kTimerSupervise, 2000, nullptr);
-    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, GetModuleHandleW(nullptr), 0);
+    StartKeyHook();
     if (g_realShell) RunStartupItems();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    if (g_hook) UnhookWindowsHookEx(g_hook);
+    StopKeyHook();
     return 0;
 }

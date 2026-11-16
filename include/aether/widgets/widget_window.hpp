@@ -35,6 +35,7 @@ public:
 
     [[nodiscard]] HWND GetHwnd() const { return m_hwnd; }
     [[nodiscard]] WidgetType GetType() const { return m_type; }
+    void SyncScalePublic() { SyncScale(); }
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -62,6 +63,15 @@ private:
     bool m_isDragging{false};
     POINT m_dragStartCursor{};
     POINT m_dragStartWindow{};
+
+    // User size: the whole card (and its glow) is drawn through a uniform scale, so every card keeps its designed layout.
+    float m_userScale{1.0f};
+    bool m_resizing{false}, m_gripHot{false}, m_trackLeave{false};
+    POINT m_resizeCardTL{};                                  // screen position of the card's top-left corner while resizing (stays put)
+    [[nodiscard]] float Eff() const { return m_dpiScale * m_userScale; }
+    [[nodiscard]] bool GripHit(int x, int y) const;
+    void ApplyScale(float u, bool persist);
+    void SyncScale();                                        // picks up a size changed in the settings
 
     // Drawing helpers (all coordinates are logical px, the context carries the DPI scale)
     void DrawText(ID2D1DeviceContext* ctx, const std::wstring& t, IDWriteTextFormat* f, const D2D1_RECT_F& r, const core::Color& c);
@@ -102,6 +112,7 @@ public:
     void Render();
     void SetVisible(bool visible);
     void SetFrameByFrame(bool on) { m_frameByFrame = on; }   // recording: render on every call
+    void SyncSizes() { for (auto& w : m_widgets) w->SyncScalePublic(); }   // after a size slider moved in the settings
     [[nodiscard]] bool IsAnimating() const { for (const auto& w : m_widgets) if (w->IsAnimating()) return true; return false; }
 
 private:

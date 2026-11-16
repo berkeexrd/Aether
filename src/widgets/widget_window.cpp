@@ -33,7 +33,7 @@ namespace {
 // The margin must be wider than the glow reaches (sigma 13-16 -> ~3 sigma), otherwise the halo is cut off at the window edge.
 constexpr float kPad = 36.0f;
 constexpr float kCardW = 264.0f;
-constexpr float kCardH[6] = {138.0f, 112.0f, 92.0f, 150.0f, 200.0f, 96.0f};   // performance, network, clock, storage, weather, now playing
+constexpr float kCardH[6] = {138.0f, 112.0f, 92.0f, 150.0f, 296.0f, 96.0f};   // performance, network, clock, storage, weather, now playing
 constexpr float kRadius = 20.0f;
 // The clock has no card in the concept: big thin digits, date above, weather below.
 constexpr float kClockW = 340.0f;
@@ -97,6 +97,22 @@ core::Color& kMuted = render::glass::kMuted;
 
 core::Color A(const core::Color& c, float a) { return core::Color{c.r, c.g, c.b, a}; }
 
+config::DesktopWidgetConfig& CfgOf(config::WidgetsConfig& w, WidgetType t) {
+    switch (t) {
+        case WidgetType::SystemMonitor: return w.sysMonWidget;
+        case WidgetType::NetworkMeter:  return w.netWidget;
+        case WidgetType::ClockCalendar: return w.clockWidget;
+        case WidgetType::Storage:       return w.storageWidget;
+        case WidgetType::Weather:       return w.weatherWidget;
+        default:                        return w.nowWidget;
+    }
+}
+float SnapScale(float u) {                                         // 2 % steps, with a magnetic stop at 100 %
+    u = std::clamp(u, 0.6f, 2.0f);
+    u = std::round(u * 50.0f) / 50.0f;
+    return std::fabs(u - 1.0f) < 0.035f ? 1.0f : u;
+}
+
 // Positions from older builds (left edge stack, or the first violet build) count as "not placed".
 bool IsUnplaced(const core::Vec2& p) {
     if (p.x < 0.0f || p.y < 0.0f) return true;
@@ -117,7 +133,8 @@ bool DesktopWidgetWindow::Create() {
     // so the widgets grow with the screen width (1.0x up to 1.5x; a 1920 px wide screen gets 1.15x).
     const float designScale = std::clamp(static_cast<float>(GetSystemMetrics(SM_CXSCREEN)) / (1672.0f * sysScale), 1.0f, 1.5f);
     m_dpiScale = sysScale * designScale;
-    const int pxW = static_cast<int>(m_width * m_dpiScale), pxH = static_cast<int>(m_height * m_dpiScale);
+    m_userScale = SnapScale(CfgOf(config::ConfigManager::Instance().GetMutable().widgets, m_type).scale);
+    const int pxW = static_cast<int>(m_width * Eff()), pxH = static_cast<int>(m_height * Eff());
 
     const auto& cfg = config::ConfigManager::Instance().Get().widgets;
     const core::Vec2* saved = nullptr;
@@ -218,8 +235,45 @@ void DesktopWidgetWindow::Show(bool show) {
     }
 }
 
+bool DesktopWidgetWindow::GripHit(int x, int y) const {
+    if (!m_hwnd || !m_shownNow) return false;
+    const float e = Eff(), right = (kPad + CardW(m_type)) * e, bottom = (kPad + CardH(m_type)) * e, g = 24.0f * e;
+    return x >= right - g && x <= right + 6.0f * e && y >= bottom - g && y <= bottom + 6.0f * e;
+}
+
+// Changes the user size: the window grows or shrinks around the card's top-left corner so the card does not jump.
+void DesktopWidgetWindow::ApplyScale(float u, bool persist) {
+    u = SnapScale(u);
+    auto& cfg = config::ConfigManager::Instance().GetMutable().widgets;
+    auto& wc = CfgOf(cfg, m_type);
+    if (!m_hwnd) { m_userScale = u; wc.scale = u; return; }
+    const float oldE = Eff();
+    RECT r; GetWindowRect(m_hwnd, &r);
+    const float tlx = m_resizing ? static_cast<float>(m_resizeCardTL.x) : r.left + kPad * oldE;
+    const float tly = m_resizing ? static_cast<float>(m_resizeCardTL.y) : r.top + kPad * oldE;
+    if (std::fabs(u - m_userScale) > 0.0005f) {
+        m_userScale = u;
+        const float e = Eff();
+        const int pw = std::max(32, static_cast<int>(std::lround(m_width * e))), ph = std::max(32, static_cast<int>(std::lround(m_height * e)));
+        const int nx = static_cast<int>(std::lround(tlx - kPad * e)), ny = static_cast<int>(std::lround(tly - kPad * e));
+        SetWindowPos(m_hwnd, nullptr, nx, ny, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (m_dcomp) m_dcomp->Resize(static_cast<uint32_t>(pw), static_cast<uint32_t>(ph));
+        wc.position = {static_cast<float>(nx), static_cast<float>(ny)};
+    }
+    wc.scale = u;
+    if (persist) config::ConfigManager::Instance().Save();
+    RedrawSoon(600);
+}
+
+void DesktopWidgetWindow::SyncScale() {
+    if (m_resizing || !m_hwnd) return;
+    const float cs = SnapScale(CfgOf(config::ConfigManager::Instance().GetMutable().widgets, m_type).scale);
+    if (std::fabs(cs - m_userScale) > 0.0005f) { ApplyScale(cs, false); Render(); }
+}
+
 void DesktopWidgetWindow::Update(float dt) {
     m_time += dt;
+    SyncScale();
     const auto& w = config::ConfigManager::Instance().Get().widgets;
     const config::DesktopWidgetConfig* c = nullptr;
     switch (m_type) {
@@ -343,7 +397,7 @@ void DesktopWidgetWindow::DrawSpark(ID2D1DeviceContext* ctx, const std::vector<f
 
 void DesktopWidgetWindow::Render() {
     if (!m_dcomp || !m_brush || !m_shownNow) return;
-    const float s = m_dpiScale;
+    const float s = Eff();
     const bool cardless = m_type == WidgetType::ClockCalendar;   // the concept's clock floats on the wallpaper
     const core::Rect card{kPad, kPad, CardW(m_type), CardH(m_type)};
     ComPtr<ID2D1PathGeometry> body;
@@ -379,6 +433,21 @@ void DesktopWidgetWindow::Render() {
         case WidgetType::NowPlaying:    RenderNowPlaying(ctx); break;
     }
 
+    if (m_gripHot || m_resizing) {   // resize grip: three short diagonal strokes in the card's bottom-right corner, and the size while dragging
+        const float cw = CardW(m_type), ch = CardH(m_type);
+        m_brush->SetColor(D2D1::ColorF(1, 1, 1, m_resizing ? 0.85f : 0.55f));
+        for (int k = 0; k < 3; ++k) {
+            const float o = 6.0f + k * 4.5f;
+            ctx->DrawLine(D2D1::Point2F(cw - 5.0f, ch - o), D2D1::Point2F(cw - o, ch - 5.0f), m_brush.Get(), 1.6f);
+        }
+        if (m_resizing) {
+            wchar_t pct[12]; swprintf_s(pct, L"%d%%", static_cast<int>(m_userScale * 100.0f + 0.5f));
+            const D2D1_RECT_F pill = D2D1::RectF(cw - 62.0f, 8.0f, cw - 10.0f, 28.0f);
+            m_brush->SetColor(D2D1::ColorF(0, 0, 0, 0.55f));
+            ctx->FillRoundedRectangle(D2D1::RoundedRect(pill, 10.0f, 10.0f), m_brush.Get());
+            DrawText(ctx, pct, m_fontCenter.Get(), pill, core::Color{1, 1, 1, 0.95f});
+        }
+    }
     ctx->SetTransform(D2D1::Matrix3x2F::Identity());
     if (intro) ctx->PopLayer();
     m_dcomp->EndDraw();
@@ -583,6 +652,26 @@ void DesktopWidgetWindow::RenderWeather(ID2D1DeviceContext* ctx) {
     const core::Color kRain{0.45f, 0.72f, 1.0f, 1.0f};
     auto hline = [&](float y, float a) { m_brush->SetColor(D2D1::ColorF(kMuted.r, kMuted.g, kMuted.b, a)); ctx->DrawLine(D2D1::Point2F(18.0f, y), D2D1::Point2F(246.0f, y), m_brush.Get(), 1.0f); };
 
+    // a soft wash behind the header, coloured by the sky (warm sun, grey cloud, blue rain, icy snow, violet night)
+    {
+        using K = bar::WeatherService::Kind;
+        core::Color tint{1.0f, 0.78f, 0.30f, 1.0f};
+        switch (kind) {
+            case K::Clear: case K::PartlyCloudy: tint = {1.0f, 0.78f, 0.30f, 1.0f}; break;
+            case K::Cloudy: case K::Fog:         tint = {0.66f, 0.72f, 0.86f, 1.0f}; break;
+            case K::Rain: case K::Storm:         tint = {0.35f, 0.62f, 1.0f, 1.0f}; break;
+            case K::Snow:                        tint = {0.78f, 0.90f, 1.0f, 1.0f}; break;
+            case K::Night: case K::NightCloudy:  tint = {0.58f, 0.50f, 1.0f, 1.0f}; break;
+        }
+        ctx->PushAxisAlignedClip(D2D1::RectF(0.0f, 0.0f, kCardW, 90.0f), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        for (int k = 0; k < 4; ++k) {
+            const float f = 1.0f - 0.2f * k;
+            m_brush->SetColor(D2D1::ColorF(tint.r, tint.g, tint.b, 0.05f));
+            ctx->FillEllipse(D2D1::Ellipse(D2D1::Point2F(78.0f, 34.0f), 100.0f * f, 36.0f * f), m_brush.Get());
+        }
+        ctx->PopAxisAlignedClip();
+    }
+
     // header: icon, big temperature, condition + city, hi/lo + feels like on the right
     MiniWeatherIcon(ctx, m_brush.Get(), 36.0f, 36.0f, 44.0f, kind, 0.0f);   // static: the cards redraw once a second, a spinning sun would stutter
     wchar_t tb[16]; swprintf_s(tb, L"%d°", w.tempC);
@@ -627,6 +716,38 @@ void DesktopWidgetWindow::RenderWeather(ID2D1DeviceContext* ctx) {
         wchar_t tb2[12]; swprintf_s(tb2, L"%d°", h.tempC);
         DrawText(ctx, tb2, m_fontTiny.Get(), D2D1::RectF(cx - 24, 166.0f, cx + 24, 180.0f), kText);
         if (h.rainPct >= 20) { wchar_t rb[12]; swprintf_s(rb, L"%%%d", h.rainPct); DrawText(ctx, rb, m_fontTiny.Get(), D2D1::RectF(cx - 24, 180.0f, cx + 24, 193.0f), kRain); }
+    }
+
+    // the next three days: weekday, icon, rain chance and a hi/lo range bar placed on a shared scale
+    hline(200.0f, 0.18f);
+    const int nd = std::min<int>(3, static_cast<int>(w.days.size()) - 1);
+    if (nd >= 1) {
+        int dlo = 99, dhi = -99;
+        for (int i = 1; i <= nd; ++i) { dlo = std::min(dlo, w.days[i].loC); dhi = std::max(dhi, w.days[i].hiC); }
+        const float span = static_cast<float>(std::max(dhi - dlo, 1));
+        for (int i = 1; i <= nd; ++i) {
+            const auto& d = w.days[i];
+            const float y = 206.0f + (i - 1) * 22.0f;
+            const std::wstring nm = i == 1 ? std::wstring(i18n::Pick(L"Tomorrow", L"Yarın")) : std::wstring(i18n::Weekday(d.dow)).substr(0, 3);
+            DrawText(ctx, nm, m_fontTinyL.Get(), D2D1::RectF(18.0f, y + 4.0f, 90.0f, y + 18.0f), i == 1 ? kText : kMuted);
+            MiniWeatherIcon(ctx, m_brush.Get(), 102.0f, y + 11.0f, 17.0f, bar::WeatherService::KindOf(d.code, true), 0.0f);
+            if (d.rainPct >= 20) { wchar_t rb[12]; swprintf_s(rb, L"%%%d", d.rainPct); DrawText(ctx, rb, m_fontTinyL.Get(), D2D1::RectF(114.0f, y + 4.0f, 144.0f, y + 18.0f), kRain); }
+            wchar_t lo[12]; swprintf_s(lo, L"%d°", d.loC);
+            DrawText(ctx, lo, m_fontTinyR.Get(), D2D1::RectF(140.0f, y + 4.0f, 164.0f, y + 18.0f), kMuted);
+            const float bx = 170.0f, bw = 46.0f, by = y + 9.0f;
+            const float a0 = bx + bw * (d.loC - dlo) / span, a1 = bx + bw * (d.hiC - dlo) / span;
+            m_brush->SetColor(D2D1::ColorF(kMuted.r, kMuted.g, kMuted.b, 0.20f));
+            ctx->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx, by, bx + bw, by + 4.0f), 2.0f, 2.0f), m_brush.Get());
+            m_brush->SetColor(D2D1::ColorF(kAccent2.r, kAccent2.g, kAccent2.b, 0.95f));
+            ctx->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(a0, by, std::max(a1, a0 + 4.0f), by + 4.0f), 2.0f, 2.0f), m_brush.Get());
+            wchar_t hi[12]; swprintf_s(hi, L"%d°", d.hiC);
+            DrawText(ctx, hi, m_fontTinyL.Get(), D2D1::RectF(222.0f, y + 4.0f, 250.0f, y + 18.0f), kText);
+        }
+    }
+    if (!w.sunrise.empty() && !w.sunset.empty()) {
+        hline(274.0f, 0.12f);
+        const std::wstring sun = std::wstring(i18n::Pick(L"Sunrise ", L"Gün doğumu ")) + w.sunrise + L"   •   " + i18n::Pick(L"Sunset ", L"Gün batımı ") + w.sunset;
+        DrawText(ctx, sun, m_fontTiny.Get(), D2D1::RectF(18.0f, 278.0f, 246.0f, 292.0f), kMuted);
     }
 }
 
@@ -700,8 +821,15 @@ void DesktopWidgetWindow::RenderNowPlaying(ID2D1DeviceContext* ctx) {
 LRESULT DesktopWidgetWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_LBUTTONDOWN: {
+            if (GripHit(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) {   // the corner grip resizes instead of moving
+                m_resizing = true;
+                SetCapture(hwnd);
+                RECT r; GetWindowRect(hwnd, &r);
+                m_resizeCardTL = {r.left + static_cast<LONG>(kPad * Eff()), r.top + static_cast<LONG>(kPad * Eff())};
+                return 0;
+            }
             if (m_type == WidgetType::NowPlaying) {
-                const float px = GET_X_LPARAM(lParam) / m_dpiScale - kPad, py = GET_Y_LPARAM(lParam) / m_dpiScale - kPad;
+                const float px = GET_X_LPARAM(lParam) / Eff() - kPad, py = GET_Y_LPARAM(lParam) / Eff() - kPad;
                 auto& ms = media::MediaService::Instance();
                 if (m_btnPrev.Contains(px, py)) { ms.PreviousTrack(); RedrawSoon(); return 0; }
                 if (m_btnPlay.Contains(px, py)) { ms.PlayPause(); RedrawSoon(); return 0; }
@@ -717,6 +845,19 @@ LRESULT DesktopWidgetWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, L
         }
 
         case WM_MOUSEMOVE: {
+            if (m_resizing) {
+                POINT c; GetCursorPos(&c);
+                const float sx = (c.x - m_resizeCardTL.x) / (CardW(m_type) * m_dpiScale);
+                const float sy = (c.y - m_resizeCardTL.y) / (CardH(m_type) * m_dpiScale);
+                const float u = SnapScale((sx + sy) * 0.5f);
+                if (std::fabs(u - m_userScale) > 0.001f) { ApplyScale(u, false); Render(); }
+                return 0;
+            }
+            if (!m_isDragging) {
+                const bool hot = GripHit(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                if (hot != m_gripHot) { m_gripHot = hot; Render(); }
+                if (!m_trackLeave) { TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, hwnd, 0}; TrackMouseEvent(&t); m_trackLeave = true; }
+            }
             if (m_isDragging) {
                 POINT currentCursor;
                 GetCursorPos(&currentCursor);
@@ -761,7 +902,35 @@ LRESULT DesktopWidgetWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, L
             return 0;
         }
 
+        case WM_MOUSELEAVE: {
+            m_trackLeave = false;
+            if (m_gripHot && !m_resizing) { m_gripHot = false; Render(); }
+            return 0;
+        }
+
+        case WM_SETCURSOR: {
+            if (LOWORD(lParam) == HTCLIENT && (m_gripHot || m_resizing)) { SetCursor(LoadCursor(nullptr, IDC_SIZENWSE)); return TRUE; }
+            break;
+        }
+
+        case WM_MOUSEWHEEL: {                                   // Ctrl + wheel resizes too
+            if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) {
+                const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+                ApplyScale(SnapScale(m_userScale + 0.06f * static_cast<float>(notches)), true);
+                Render();
+                return 0;
+            }
+            break;
+        }
+
         case WM_LBUTTONUP: {
+            if (m_resizing) {
+                m_resizing = false;
+                ReleaseCapture();
+                ApplyScale(m_userScale, true);
+                Render();
+                return 0;
+            }
             if (m_isDragging) {
                 m_isDragging = false;
                 ReleaseCapture();
@@ -774,9 +943,11 @@ LRESULT DesktopWidgetWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, L
             if (m_isDragging) return 0;
             POINT pt; GetCursorPos(&pt);
             const int cmd = ui::ShowContextMenu({
+                ui::MenuItem(3, i18n::Pick(L"Reset size", L"Boyutu sıfırla"), 0xE72C),
                 ui::MenuItem(1, L"Bu widget'ı gizle", 0xE711),
                 ui::MenuItem(2, L"Tüm widget'ları gizle", 0xE8BB, true),
             }, pt, false);
+            if (cmd == 3) { ApplyScale(1.0f, true); Render(); return 0; }
             if (cmd == 1 || cmd == 2) {
                 auto& cfg = config::ConfigManager::Instance().GetMutable();
                 if (cmd == 2) cfg.widgets.enabled = false;

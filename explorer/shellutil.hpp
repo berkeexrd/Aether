@@ -11,6 +11,7 @@
 #include <vector>
 #include <wrl/client.h>
 #include "model.hpp"
+#include "aether/core/crash.hpp"
 
 namespace aether::shellutil {
 
@@ -30,7 +31,7 @@ enum class Op { Copy, Move, Delete, DeletePerm, Rename };
 
 // Runs on a worker thread; posts `doneMsg` (lParam = malloc'ed wchar_t* name to select, or null) to `owner` when finished.
 inline void RunFileOp(HWND owner, UINT doneMsg, Op op, std::vector<std::wstring> src, std::wstring dest, std::wstring newName, std::wstring selectAfter) {
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         {
             ComPtr<IFileOperation> fo;

@@ -13,9 +13,14 @@
 #include "aether/bar/flyouts.hpp"
 #include "aether/bar/panels.hpp"
 #include "aether/bar/tray_host.hpp"
+#include "aether/bar/toast_host.hpp"
+#include "aether/bar/notifications.hpp"
 #include "aether/bar/weather.hpp"
 #include "aether/core/i18n.hpp"
 #include "aether/core/monitors.hpp"
+#include "aether/system/shell_keys.hpp"
+#include "aether/core/crash.hpp"
+#include <atomic>
 
 using namespace aether::bar;
 
@@ -26,15 +31,59 @@ constexpr UINT kMsgRebuild     = WM_APP + 2;   // monitors / DPI changed
 constexpr UINT kMsgReapplyHide = WM_APP + 3;   // Explorer restarted
 
 DWORD g_mainThread = 0;
-HHOOK g_hook = nullptr;
-bool  g_winDown = false;
-bool  g_combo = false;
+HHOOK g_hook = nullptr;                 // owned by the hook thread
+DWORD g_hookThreadId = 0;
+HANDLE g_hookThread = nullptr;
+bool  g_winDown = false;                // hook thread only
+bool  g_combo = false;                  // hook thread only
+std::atomic<HWND> g_shellCtl{nullptr};  // AetherShell's control window (it owns the Alt+Tab switcher and the run box)
+std::atomic<bool> g_shellElevated{false};
+
+bool IsPidElevated(DWORD pid) {
+    if (!pid) return false;
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return true;                                  // cannot even look at it: it is more privileged than we may see
+    bool elevated = true;
+    HANDLE tok = nullptr;
+    if (OpenProcessToken(p, TOKEN_QUERY, &tok)) {
+        TOKEN_ELEVATION te{}; DWORD n = 0;
+        if (GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &n)) elevated = te.TokenIsElevated != 0;
+        CloseHandle(tok);
+    }
+    CloseHandle(p);
+    return elevated;
+}
+
+void RefreshShellInfo() {
+    HWND c = FindWindowExW(HWND_MESSAGE, nullptr, aether::shellkeys::kCtlClass, nullptr);
+    g_shellCtl = c;
+    DWORD pid = 0;
+    if (c) GetWindowThreadProcessId(c, &pid);
+    g_shellElevated = pid != 0 && IsPidElevated(pid);
+}
+
+bool PostToShell(UINT m, WPARAM w, LPARAM l) {
+    HWND c = g_shellCtl;
+    return c && PostMessageW(c, m, w, l) != 0;
+}
+
+// AetherShell's own hook cannot see keys while an elevated window (admin console, our own Start menu ...) has focus: UIPI.
+// In exactly that case this (elevated) process takes the shortcuts over, so Windows' own Alt+Tab / Win+R never show up.
+bool ElevatedForeground() {
+    if (!g_shellCtl.load() || g_shellElevated.load()) return false;
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return IsPidElevated(pid);
+}
 
 // Win key tap (press + release with nothing in between) opens Aether Start instead of the stock one.
 // Win+E, Win+D, Win+B ... still work because those count as a combo.
 LRESULT CALLBACK KeyboardHook(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION) {
         const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
+        if (aether::shellkeys::Route(k, wp, PostToShell, ElevatedForeground)) return 1;
         if (!(k->flags & LLKHF_INJECTED)) {
             const bool isWin = (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN);
             const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
@@ -42,12 +91,11 @@ LRESULT CALLBACK KeyboardHook(int code, WPARAM wp, LPARAM lp) {
                 if (down) {
                     if (!g_winDown) { g_winDown = true; g_combo = false; }
                 } else {
-                    if (g_winDown && !g_combo) {
+                    // AetherShell may have consumed a Win+<key> shortcut before this hook ever saw the key: it tells us (g_winComboTick)
+                    const bool shellCombo = GetTickCount64() - aether::shellkeys::g_winComboTick.load() < 1500;
+                    if (g_winDown && !g_combo && !shellCombo) {
                         // Inject an unassigned key so Windows treats this as Win+<key> and skips its own Start
-                        INPUT in[2] = {};
-                        in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = 0xE8;
-                        in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = 0xE8; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
-                        SendInput(2, in, sizeof(INPUT));
+                        aether::shellkeys::MaskKeys();
                         PostThreadMessageW(g_mainThread, kMsgToggleStart, 0, 0);
                     }
                     g_winDown = false;
@@ -58,6 +106,36 @@ LRESULT CALLBACK KeyboardHook(int code, WPARAM wp, LPARAM lp) {
         }
     }
     return CallNextHookEx(g_hook, code, wp, lp);
+}
+
+// The hook gets a thread of its own. On the render thread a slow frame (icon loading, window enumeration) made the hook answer
+// too late, and Windows then drops such a hook silently: no Start menu on the Win key until the bar was restarted.
+DWORD WINAPI HookThread(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    MSG msg;
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    RefreshShellInfo();
+    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook, GetModuleHandleW(nullptr), 0);
+    SetTimer(nullptr, 1, 3000, nullptr);
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message != WM_TIMER) continue;
+        RefreshShellInfo();
+        if (g_winDown || aether::shellkeys::g_swActive) continue;
+        if (HHOOK fresh = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook, GetModuleHandleW(nullptr), 0)) {   // fresh hook in case the system dropped ours
+            if (g_hook) UnhookWindowsHookEx(g_hook);
+            g_hook = fresh;
+        }
+    }
+    if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
+    return 0;
+}
+
+void StartKeyHook() { g_hookThread = CreateThread(nullptr, 0, HookThread, nullptr, 0, &g_hookThreadId); }
+void StopKeyHook() {
+    if (!g_hookThread) return;
+    PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
+    WaitForSingleObject(g_hookThread, 2000);
+    CloseHandle(g_hookThread); g_hookThread = nullptr;
 }
 
 class BarManager {
@@ -75,6 +153,11 @@ public:
         m_notify.Create(L"Aether.NotifyPanel");
         m_weatherPanel.Create(L"Aether.WeatherPanel");
         m_net.Create(L"Aether.NetPanel");
+        // Aether's own notification pop-ups; Windows' banners are hidden while they are on
+        m_toast.Create();
+        NotificationFeed::Instance().StartWatching();
+        NativeToastHider::Enable(aether::system::notifycfg::Load().enabled);
+        NativeToastHider::Start();
         ShellTaskbarGuard::Instance().Hide(m_hard);
         Rebuild();
         return !m_bars.empty();
@@ -98,6 +181,9 @@ public:
     }
 
     void Shutdown() {
+        NativeToastHider::Stop();
+        NotificationFeed::Instance().StopWatching();
+        m_toast.Shutdown();
         WeatherService::Instance().Stop();
         TrayHost::Instance().Destroy();   // hands the icons back to Explorer
         m_bars.clear();
@@ -124,6 +210,7 @@ public:
         animating |= m_notify.Frame(dt);
         animating |= m_weatherPanel.Frame(dt);
         animating |= m_net.Frame(dt);
+        animating |= m_toast.Frame(dt);
         m_pruneTimer += dt;
         if (m_pruneTimer >= 3.0f) { m_pruneTimer = 0.0f; TrayHost::Instance().Prune(); }
         return animating || m_rebuildAt.has_value();
@@ -140,14 +227,15 @@ private:
     NotifyPanel m_notify;
     WeatherPanel m_weatherPanel;
     NetPanel m_net;
+    ToastHost m_toast;
     float m_pruneTimer{0.0f};
     std::vector<std::unique_ptr<AetherBar>> m_bars;
     std::optional<std::chrono::steady_clock::time_point> m_rebuildAt;
 };
 
-LONG WINAPI CrashHandler(EXCEPTION_POINTERS*) {
-    ShellTaskbarGuard::Instance().Restore();
-    return EXCEPTION_CONTINUE_SEARCH;
+LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
+    ShellTaskbarGuard::Instance().Restore();                // the Windows taskbar must come back even when we die
+    return aether::core::CrashFilter(ep);                   // mini dump + crash.log in %APPDATA%\Aether\crash
 }
 
 } // namespace
@@ -165,6 +253,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    aether::core::InstallCrashHandler(L"AetherBar");
     SetUnhandledExceptionFilter(CrashHandler);
     atexit([] { ShellTaskbarGuard::Instance().Restore(); });
 
@@ -183,7 +272,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
         }
 
         g_mainThread = GetCurrentThreadId();
-        if (useHook) g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook, GetModuleHandleW(nullptr), 0);
+        if (useHook) StartKeyHook();
 
         LARGE_INTEGER freq, last;
         QueryPerformanceFrequency(&freq);
@@ -211,7 +300,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
 
             if (!manager.Frame(dt)) MsgWaitForMultipleObjectsEx(0, nullptr, 120, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
-        if (g_hook) UnhookWindowsHookEx(g_hook);
+        StopKeyHook();
         manager.Shutdown();
     }
     ShellTaskbarGuard::Instance().Restore();

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "aether/config/config_manager.hpp"
 #include "aether/core/log.hpp"
 #include "aether/core/events.hpp"
@@ -66,6 +67,8 @@ bool ConfigManager::Save() {
         j["island"]["expandedVolumeWidth"] = m_config.island.expandedVolumeWidth;
         j["island"]["expandedVolumeHeight"] = m_config.island.expandedVolumeHeight;
         j["island"]["topOffset"] = m_config.island.topOffset;
+        j["island"]["posX"] = m_config.island.posX;
+        j["island"]["posY"] = m_config.island.posY;
         j["island"]["expandOnHover"] = m_config.island.expandOnHover;
         j["island"]["hoverDelayMs"] = m_config.island.hoverDelayMs;
         j["island"]["pinOnClick"] = m_config.island.pinOnClick;
@@ -88,7 +91,8 @@ bool ConfigManager::Save() {
                 {"sizeW", w.size.x},
                 {"sizeH", w.size.y},
                 {"opacity", w.opacity},
-                {"locked", w.locked}
+                {"locked", w.locked},
+                {"scale", w.scale}
             };
         };
 
@@ -172,6 +176,8 @@ bool ConfigManager::Load() {
             if (ji.contains("expandedVolumeWidth")) m_config.island.expandedVolumeWidth = ji["expandedVolumeWidth"];
             if (ji.contains("expandedVolumeHeight")) m_config.island.expandedVolumeHeight = ji["expandedVolumeHeight"];
             if (ji.contains("topOffset")) m_config.island.topOffset = ji["topOffset"];
+            if (ji.contains("posX")) m_config.island.posX = std::clamp(ji["posX"].get<float>(), 0.0f, 100.0f);
+            if (ji.contains("posY")) m_config.island.posY = std::clamp(ji["posY"].get<float>(), 0.0f, 100.0f);
             if (ji.contains("expandOnHover")) m_config.island.expandOnHover = ji["expandOnHover"];
             if (ji.contains("hoverDelayMs")) m_config.island.hoverDelayMs = ji["hoverDelayMs"];
             if (ji.contains("pinOnClick")) m_config.island.pinOnClick = ji["pinOnClick"];
@@ -190,6 +196,7 @@ bool ConfigManager::Load() {
             if (jw.contains("sizeH")) w.size.y = jw["sizeH"];
             if (jw.contains("opacity")) w.opacity = jw["opacity"];
             if (jw.contains("locked")) w.locked = jw["locked"];
+            if (jw.contains("scale")) w.scale = std::clamp(jw["scale"].get<float>(), 0.6f, 2.0f);
         };
 
         if (j.contains("widgets")) {

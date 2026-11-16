@@ -32,12 +32,14 @@ public:
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
     void OnData(const void* data, DWORD size);
+    void Rebroadcast();
     TrayIcon* Find(HWND hwnd, UINT id);
 
     HWND m_hwnd{nullptr};
     std::vector<TrayIcon> m_icons;
     unsigned m_version{1};
     unsigned m_serial{1};
+    unsigned m_stage{0};          // how many "TaskbarCreated" re-broadcasts have gone out (late-starting apps register after it)
 };
 
 } // namespace aether::bar

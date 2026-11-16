@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <nlohmann/json.hpp>
+#include "aether/core/crash.hpp"
 
 #pragma comment(lib, "winhttp.lib")
 
@@ -141,7 +142,9 @@ void WeatherService::Loop() {
     auto next = clock::now();
     while (m_running) {
         if (clock::now() >= next || m_refreshNow.exchange(false)) {
-            next = clock::now() + (Fetch() ? std::chrono::minutes(15) : std::chrono::minutes(2));
+            bool ok = false;
+            try { ok = Fetch(); } catch (...) { ok = false; }          // a malformed answer must not kill the thread (or the bar)
+            next = clock::now() + (ok ? std::chrono::minutes(15) : std::chrono::minutes(2));
         }
         for (int i = 0; i < 10 && m_running && !m_refreshNow; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -149,7 +152,7 @@ void WeatherService::Loop() {
 
 void WeatherService::Start() {
     if (m_running.exchange(true)) return;
-    m_thread = std::thread([this] { Loop(); });
+    m_thread = ::aether::core::SafeThread("bg", [this] { Loop(); });
 }
 
 void WeatherService::Stop() {

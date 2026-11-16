@@ -1,6 +1,8 @@
 // AetherIntro: the greeting animation shown when Aether starts (logon / first run).
-//   AetherIntro.exe           short version (~4 s)
-//   AetherIntro.exe --first   welcome version (~6.5 s), launched by the installer
+//   AetherIntro.exe           short version (~3.4 s)
+//   AetherIntro.exe --first   welcome version (~5.2 s), launched by the installer
+// Design: quiet and still. The theme's deepest colour, one soft light from above, the logo easing in, the wordmark rising out of a mask
+// and a hairline progress bar. No particles, no moving glows, no slogans.
 // Any click, Esc, Enter or Space skips it. A file %APPDATA%\Aether\no-intro disables the logon intro (AetherShell checks it).
 #include <windows.h>
 #include <shellscalingapi.h>
@@ -20,11 +22,12 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 bool g_first = false;
-float g_T = 4.2f;
+float g_T = 3.4f;
 
 float Clamp01(float x) { return std::clamp(x, 0.0f, 1.0f); }
 float Smooth(float x) { x = Clamp01(x); return x * x * (3.0f - 2.0f * x); }
-float EaseOutBack(float x) { x = Clamp01(x); const float c1 = 1.70158f, c3 = c1 + 1.0f; return 1.0f + c3 * std::pow(x - 1.0f, 3.0f) + c1 * std::pow(x - 1.0f, 2.0f); }
+float EaseOutCubic(float x) { x = Clamp01(x); const float u = 1.0f - x; return 1.0f - u * u * u; }
+float EaseInOut(float x) { x = Clamp01(x); return x < 0.5f ? 4.0f * x * x * x : 1.0f - std::pow(-2.0f * x + 2.0f, 3.0f) / 2.0f; }
 
 bool Turkish() { return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_TURKISH; }
 
@@ -53,8 +56,6 @@ ComPtr<ID2D1Bitmap1> LoadLogoBitmap(ID2D1DeviceContext* ctx) {
     return out;
 }
 
-struct Particle { float x, y, r, speed, phase; };
-
 class Intro {
 public:
     bool Create(HINSTANCE inst) {
@@ -73,9 +74,6 @@ public:
         m_g.Init(m_dc.get());
         render::glass::SyncTheme();                      // follow the theme chosen in Aether settings (%APPDATA%\Aether\theme.txt)
         m_W = rc.right / m_scale; m_H = rc.bottom / m_scale;
-        unsigned seed = 7;
-        auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) / 16777216.0f; };
-        for (int i = 0; i < 80; ++i) m_parts.push_back({rnd() * m_W, rnd() * m_H, 0.8f + rnd() * 2.2f, 6.0f + rnd() * 22.0f, rnd() * 6.28f});
         QueryPerformanceFrequency(&m_freq); QueryPerformanceCounter(&m_t0);
         ShowWindow(m_hwnd, SW_SHOWNA);
         SetForegroundWindow(m_hwnd);
@@ -92,7 +90,6 @@ private:
     std::unique_ptr<render::DCompLayer> m_dc;
     mg::Gfx m_g;
     float m_scale{1.0f}, m_W{0}, m_H{0};
-    std::vector<Particle> m_parts;
     ComPtr<ID2D1Bitmap1> m_logo;
     LARGE_INTEGER m_freq{}, m_t0{};
     bool m_armed{false};
@@ -137,59 +134,60 @@ private:
         if (!m_logo) m_logo = LoadLogoBitmap(ctx);
         render::glass::SyncTheme();                      // pick up a theme change mid-intro too
         ctx->SetTransform(D2D1::Matrix3x2F::Scale(m_scale, m_scale));
-        const float W = m_W, H = m_H, cx = W * 0.5f, cy = H * 0.5f - 34.0f;
-        const float fadeIn = Smooth(t / 0.55f), fadeOut = 1.0f - Smooth((t - (g_T - 0.7f)) / 0.7f);
+        const float W = m_W, H = m_H, cx = W * 0.5f, cy = H * 0.5f - 30.0f;
+        const float fadeIn = Smooth(t / 0.45f), fadeOut = 1.0f - Smooth((t - (g_T - 0.55f)) / 0.55f);
         const float A = fadeIn * fadeOut;
-        // Live theme palette (updates if the theme changed after we started).
         const auto& th = render::glass::CurrentTheme();
-        const Color accent{render::glass::kViolet}, light{render::glass::kVioletLight}, accent2{render::glass::kAccent2};
-
-        m_g.FillRect(Rect{0, 0, W, H}, Color{th.bodyBot.r, th.bodyBot.g, th.bodyBot.b, A});
-        // slow aurora in the theme's own colours
-        const float R = std::max(W, H);
-        Radial(W * (0.28f + 0.06f * std::sin(t * 0.7f)), H * (0.30f + 0.05f * std::cos(t * 0.6f)), R * 0.55f, mg::WithA(accent, 0.30f * A), mg::WithA(accent, 0.0f));
-        Radial(W * (0.74f + 0.05f * std::cos(t * 0.5f)), H * (0.70f + 0.06f * std::sin(t * 0.8f)), R * 0.50f, mg::WithA(accent2, 0.20f * A), mg::WithA(accent2, 0.0f));
-        Radial(W * 0.62f, H * (0.22f + 0.04f * std::sin(t * 0.9f)), R * 0.40f, mg::WithA(light, 0.14f * A), mg::WithA(light, 0.0f));
-
-        // drifting particles
-        for (const auto& p : m_parts) {
-            const float y = std::fmod(p.y - t * p.speed + H * 4.0f, H);
-            const float tw = 0.35f + 0.65f * (0.5f + 0.5f * std::sin(t * 1.6f + p.phase));
-            m_g.FillRR(Rect{p.x - p.r, y - p.r, p.r * 2, p.r * 2}, p.r, Color{light.r, light.g, light.b, 0.55f * tw * A * Smooth((t - 0.2f) / 1.0f)});
-        }
-
-        // the Aether logo itself (from the embedded PNG), with a soft theme-coloured halo
-        const float logoK = EaseOutBack((t - 0.25f) / 1.1f);
-        const float logoSize = 96.0f;
-        const float s = logoSize * std::max(0.0f, logoK) * (1.0f + 0.02f * std::sin(t * 2.2f));
-        if (m_logo && s > 1.0f) {
-            Radial(cx, cy, s * 1.7f, mg::WithA(accent, 0.30f * A), mg::WithA(accent, 0.0f));
-            D2D1_RECT_F dst = D2D1::RectF(cx - s * 0.5f, cy - s * 0.5f, cx + s * 0.5f, cy + s * 0.5f);
-            ctx->DrawBitmap(m_logo.Get(), &dst, A, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
-        }
-
-        // title, letter by letter
-        const std::wstring title = L"AETHER";
-        const float fs = 62.0f, gap = 16.0f;
-        float total = 0; std::vector<float> wd;
-        for (wchar_t ch : title) { const float w = m_g.TextWidth(std::wstring(1, ch), fs, 300); wd.push_back(w); total += w + gap; }
-        total -= gap;
-        float x = cx - total * 0.5f; const float ty = cy + 78.0f;
-        for (size_t i = 0; i < title.size(); ++i) {
-            const float a = Smooth((t - (1.05f + 0.11f * i)) / 0.55f) * A;
-            if (a > 0.003f) {
-                const float oy = (1.0f - a) * 16.0f;
-                m_g.Text(std::wstring(1, title[i]), Rect{x - 6, ty + oy + 2, wd[i] + 12, fs + 14}, fs, 300, Color{accent.r, accent.g, accent.b, 0.35f * a}, DWRITE_TEXT_ALIGNMENT_CENTER);
-                m_g.Text(std::wstring(1, title[i]), Rect{x - 6, ty + oy, wd[i] + 12, fs + 14}, fs, 300, Color{1, 1, 1, a}, DWRITE_TEXT_ALIGNMENT_CENTER);
-            }
-            x += wd[i] + gap;
-        }
+        const Color accent{render::glass::kViolet}, light{render::glass::kVioletLight};
         const bool tr = Turkish();
-        const std::wstring sub = g_first ? (tr ? L"Hoş geldin. Masaüstün yeniden doğuyor." : L"Welcome. Your desktop, reborn.") : (tr ? L"Masaüstün hazırlanıyor" : L"Preparing your desktop");
-        const float sa = Smooth((t - 2.0f) / 0.8f) * A;
-        m_g.Text(sub, Rect{0, ty + fs + 22, W, 30}, 17.0f, 300, Color{render::glass::kText.r, render::glass::kText.g, render::glass::kText.b, 0.85f * sa}, DWRITE_TEXT_ALIGNMENT_CENTER);
 
-        if (g_first) m_g.Text(tr ? L"Atlamak için tıkla" : L"Click to skip", Rect{0, H - 56, W, 20}, 11.5f, 400, Color{1, 1, 1, 0.38f * sa}, DWRITE_TEXT_ALIGNMENT_CENTER);
+        // backdrop: the theme's deepest colour, one still light from above and a soft vignette
+        m_g.FillRect(Rect{0, 0, W, H}, Color{th.bodyBot.r * 0.55f, th.bodyBot.g * 0.55f, th.bodyBot.b * 0.55f, A});
+        const float R = std::max(W, H);
+        Radial(cx, cy - H * 0.16f, R * 0.60f, mg::WithA(accent, 0.15f * A * Smooth(t / 1.4f)), mg::WithA(accent, 0.0f));
+        Radial(cx, H * 0.5f, std::sqrt(W * W + H * H) * 0.5f, Color{0, 0, 0, 0.0f}, Color{0, 0, 0, 0.50f * A});
+
+        // the logo: fades in and settles from 94 % to 100 %, nothing bounces or pulses
+        const float lk = EaseOutCubic((t - 0.12f) / 0.95f), la = lk * A;
+        const float logoSize = 84.0f, s = logoSize * (0.94f + 0.06f * lk);
+        if (m_logo && la > 0.002f) {
+            Radial(cx, cy, logoSize * 1.30f, mg::WithA(accent, 0.20f * la), mg::WithA(accent, 0.0f));
+            const D2D1_RECT_F dst = D2D1::RectF(cx - s * 0.5f, cy - s * 0.5f, cx + s * 0.5f, cy + s * 0.5f);
+            ctx->DrawBitmap(m_logo.Get(), &dst, la, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        }
+
+        // wordmark: small, light, evenly tracked; each letter rises out of a mask a hair after the one before
+        const std::wstring title = L"AETHER";
+        const float fs = 19.0f, gap = 8.0f, baseY = cy + logoSize * 0.5f + 36.0f;
+        float total = 0; std::vector<float> wd;
+        for (wchar_t ch : title) { const float w = m_g.TextWidth(std::wstring(1, ch), fs, 500); wd.push_back(w); total += w + gap; }
+        total -= gap;
+        {
+            const D2D1_RECT_F clip = D2D1::RectF(cx - total * 0.5f - 12.0f, baseY - 2.0f, cx + total * 0.5f + 12.0f, baseY + fs + 14.0f);
+            ctx->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            float x = cx - total * 0.5f;
+            for (size_t i = 0; i < title.size(); ++i) {
+                const float k = EaseOutCubic((t - 0.80f - 0.045f * static_cast<float>(i)) / 0.70f);
+                if (k > 0.003f)
+                    m_g.Text(std::wstring(1, title[i]), Rect{x - 6, baseY + (1.0f - k) * (fs + 6.0f), wd[i] + 12, fs + 12}, fs, 500, Color{1, 1, 1, 0.94f * A}, DWRITE_TEXT_ALIGNMENT_CENTER);
+                x += wd[i] + gap;
+            }
+            ctx->PopAxisAlignedClip();
+        }
+
+        // hairline progress bar and one quiet status line
+        const float barW = 168.0f, barY = baseY + fs + 34.0f;
+        const float ba = Smooth((t - 1.05f) / 0.5f) * A;
+        if (ba > 0.003f) {
+            const float p = EaseInOut((t - 1.10f) / std::max(0.5f, g_T - 1.10f - 0.60f));
+            const Rect track{cx - barW * 0.5f, barY, barW, 2.0f};
+            m_g.FillRR(track, 1.0f, Color{1, 1, 1, 0.10f * ba});
+            if (p > 0.002f) m_g.FillRR(Rect{track.x, track.y, std::max(2.0f, barW * p), 2.0f}, 1.0f, Color{light.r, light.g, light.b, 0.95f * ba});
+            const std::wstring status = g_first ? (tr ? L"Masaüstün hazırlanıyor" : L"Setting up your desktop") : (tr ? L"Başlatılıyor" : L"Starting");
+            m_g.Text(status, Rect{0, barY + 14.0f, W, 20}, 11.5f, 400, Color{1, 1, 1, 0.48f * ba}, DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+
+        if (g_first) m_g.Text(tr ? L"Atlamak için tıkla" : L"Click to skip", Rect{0, H - 52, W, 20}, 11.0f, 400, Color{1, 1, 1, 0.28f * ba}, DWRITE_TEXT_ALIGNMENT_CENTER);
         m_g.End();
     }
 };
@@ -201,7 +199,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     HANDLE once = CreateMutexW(nullptr, TRUE, L"Aether.Intro.SingleInstance");
     if (once && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (cmd && wcsstr(cmd, L"--first")) { g_first = true; g_T = 6.5f; }
+    if (cmd && wcsstr(cmd, L"--first")) { g_first = true; g_T = 5.2f; }
     Intro intro;
     if (!intro.Create(inst)) return 1;
     intro.Run();

@@ -38,14 +38,28 @@ bool TrayHost::Create() {
     if (!m_hwnd) return false;
     ChangeWindowMessageFilterEx(m_hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);   // we run elevated (UIPI)
     SetWindowLongPtrW(m_hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-    PostMessageW(HWND_BROADCAST, RegisterWindowMessageW(L"TaskbarCreated"), 0, 0);   // apps re-register their icons
+    // Apps re-register their icons when they see "TaskbarCreated". One broadcast is not enough: apps that are still starting up, are busy
+    // or re-create their message window later miss it, and their icon would never show. So it is repeated a few times after start.
+    PostMessageW(HWND_BROADCAST, RegisterWindowMessageW(L"TaskbarCreated"), 0, 0);
+    m_stage = 0;
+    SetTimer(m_hwnd, 1, 1500, nullptr);
     return true;
+}
+
+void TrayHost::Rebroadcast() {
+    if (!m_hwnd) return;
+    PostMessageW(HWND_BROADCAST, RegisterWindowMessageW(L"TaskbarCreated"), 0, 0);
+    ++m_stage;
+    // 1.5 s, +3.5 s, +10 s, +20 s after start, then every 60 s for good measure (cheap: apps that already have their icon just update it)
+    static const UINT kDelays[] = {3500, 10000, 20000};
+    SetTimer(m_hwnd, 1, m_stage <= 3 ? kDelays[m_stage - 1] : 60000u, nullptr);
 }
 
 void TrayHost::Destroy() {
     if (!m_hwnd) return;
     for (auto& i : m_icons) if (i.icon) DestroyIcon(i.icon);
     m_icons.clear();
+    KillTimer(m_hwnd, 1);
     DestroyWindow(m_hwnd);
     m_hwnd = nullptr;
     PostMessageW(HWND_BROADCAST, RegisterWindowMessageW(L"TaskbarCreated"), 0, 0);   // hand icons back to Explorer
@@ -53,6 +67,7 @@ void TrayHost::Destroy() {
 
 LRESULT CALLBACK TrayHost::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto* self = reinterpret_cast<TrayHost*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_TIMER && wp == 1 && self) { self->Rebroadcast(); return 0; }
     if (msg == WM_COPYDATA && self) {
         const auto* cds = reinterpret_cast<const COPYDATASTRUCT*>(lp);
         if (cds && cds->dwData == 1 && cds->lpData) self->OnData(cds->lpData, cds->cbData);
@@ -80,16 +95,27 @@ void TrayHost::OnData(const void* data, DWORD size) {
         case kModify: {
             TrayIcon* t = Find(hwnd, id);
             if (!t) {
-                if (d.message == kModify) return;
+                // A MODIFY for an icon we never saw (the app registered with Explorer before we took over): treat it as an ADD instead of dropping it
+                if (!IsWindow(hwnd)) return;
                 m_icons.push_back({}); t = &m_icons.back(); t->hwnd = hwnd; t->id = id;
             }
             if (n.uFlags & NIF_MESSAGE) t->callbackMsg = n.uCallbackMessage;
             if (n.uFlags & NIF_TIP) t->tip = n.szTip;
             if (n.uFlags & NIF_STATE) t->hidden = (n.dwStateMask & NIS_HIDDEN) && (n.dwState & NIS_HIDDEN);
             if (n.uFlags & NIF_ICON) {
-                if (t->icon) DestroyIcon(t->icon);
-                t->icon = n.hIcon ? CopyIcon(H<HICON__>(n.hIcon)) : nullptr;
-                t->serial = ++m_serial;
+                HICON copy = n.hIcon ? CopyIcon(H<HICON__>(n.hIcon)) : nullptr;
+                if (!copy && !t->icon && IsWindow(hwnd)) {      // the handle could not be copied: the owner window's own icon is better than an empty slot
+                    DWORD_PTR r = 0;
+                    HICON wi = nullptr;
+                    if (SendMessageTimeoutW(hwnd, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG, 50, &r) && r) wi = reinterpret_cast<HICON>(r);
+                    if (!wi) wi = reinterpret_cast<HICON>(GetClassLongPtrW(hwnd, GCLP_HICONSM));
+                    if (wi) copy = CopyIcon(wi);
+                }
+                if (copy || !t->icon) {                        // keep the old image when the new one is unusable
+                    if (t->icon) DestroyIcon(t->icon);
+                    t->icon = copy;
+                    t->serial = ++m_serial;
+                }
             }
             break;
         }

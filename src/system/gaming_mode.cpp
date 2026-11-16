@@ -3,6 +3,7 @@
 #include "aether/core/events.hpp"
 #include <shellapi.h>
 #include <psapi.h>
+#include "aether/core/crash.hpp"
 
 #pragma comment(lib, "shell32.lib")
 
@@ -12,7 +13,7 @@ void GamingModeDetector::Start(uint32_t pollingIntervalMs) {
     if (m_running) return;
     m_intervalMs = pollingIntervalMs;
     m_running = true;
-    m_workerThread = std::thread(&GamingModeDetector::WorkerLoop, this);
+    m_workerThread = ::aether::core::SafeThread("gaming", [this] { WorkerLoop(); });
     AETHER_LOG_INFO("GamingModeDetector started (interval: " << pollingIntervalMs << "ms)");
 }
 

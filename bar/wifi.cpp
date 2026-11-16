@@ -3,6 +3,7 @@
 #include <wlanapi.h>
 #include <algorithm>
 #include <thread>
+#include "aether/core/crash.hpp"
 
 #pragma comment(lib, "wlanapi.lib")
 
@@ -51,7 +52,7 @@ void WifiService::Refresh(bool scan) {
         if (m_state.scanning) return;
         if (scan) m_state.scanning = true;
     }
-    std::thread([this, scan] { std::lock_guard<std::mutex> op(m_op); DoRefresh(scan); }).detach();
+    ::aether::core::SafeThread("bg", [this, scan] { std::lock_guard<std::mutex> op(m_op); DoRefresh(scan); }).detach();
 }
 
 void WifiService::DoRefresh(bool scan) {
@@ -105,7 +106,7 @@ void WifiService::DoRefresh(bool scan) {
 
 void WifiService::Connect(const std::wstring& ssid, const std::wstring& password, bool known, bool secure, unsigned authAlgo) {
     { std::lock_guard<std::mutex> l(m_mutex); m_state.busy = true; m_state.status.clear(); }
-    std::thread([=, this] {
+    ::aether::core::SafeThread("bg", [=, this] {
         std::lock_guard<std::mutex> op(m_op);
         bool ok = false;
         {
@@ -145,12 +146,12 @@ void WifiService::Connect(const std::wstring& ssid, const std::wstring& password
 }
 
 void WifiService::Disconnect() {
-    std::thread([this] { std::lock_guard<std::mutex> op(m_op); { Handle w; if (w.ok) WlanDisconnect(w.h, &w.guid, nullptr); } Sleep(600); DoRefresh(false); }).detach();
+    ::aether::core::SafeThread("bg", [this] { std::lock_guard<std::mutex> op(m_op); { Handle w; if (w.ok) WlanDisconnect(w.h, &w.guid, nullptr); } Sleep(600); DoRefresh(false); }).detach();
 }
 
 void WifiService::SetRadio(bool on) {
     { std::lock_guard<std::mutex> l(m_mutex); m_state.busy = true; }
-    std::thread([this, on] {
+    ::aether::core::SafeThread("bg", [this, on] {
         std::lock_guard<std::mutex> op(m_op);
         {
             Handle w;

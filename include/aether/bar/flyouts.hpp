@@ -103,11 +103,20 @@ public:
     CalendarPanel() { m_baseW = 372; m_baseH = 500; }
 protected:
     void OnShow() override;
+    void OnTick(float dt) override;
     void OnDraw(ID2D1DeviceContext*, const core::Rect&) override;
     void OnClick(int id, const core::Vec2&) override;
     void OnWheel(float n) override;
 private:
+    void NavigateTo(int year, int month);                       // slides to another month (and cross-fades the season effect when the season changes)
+    void DrawMonthGrid(ID2D1DeviceContext*, float x, float gy, float cw, int year, int month, const SYSTEMTIME& now, float yOff, float alpha, bool interactive);
+    void DrawSeason(ID2D1DeviceContext*, const core::Rect& panel, int season, float alpha);   // snow / petals / sun / leaves, drawn behind the text
+    static int SeasonOf(int month) { return (month == 12 || month <= 2) ? 0 : (month <= 5 ? 1 : (month <= 8 ? 2 : 3)); }
     int m_year{2026}, m_month{1}, m_selDay{0}, m_selMonth{0}, m_selYear{0};
+    int m_prevYear{2026}, m_prevMonth{1}, m_dir{1};
+    float m_anim{1.0f};                                         // 0..1 progress of the month slide
+    int m_season{0}, m_prevSeason{0};
+    float m_seasonT{1.0f};                                      // 0..1 cross-fade between two seasons
 };
 
 // System tray (icons of every app, served by TrayHost)

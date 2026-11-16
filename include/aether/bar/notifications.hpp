@@ -6,6 +6,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace aether::bar {
@@ -36,14 +37,25 @@ public:
     void DismissAll();
     // Returns true once the icon is ready; starts resolving it the first time an app id is asked for.
     bool AppVisualFor(const std::wstring& appId, AppVisual& out);
+    // Toasts that arrived since the last call (never the ones that were already there when the feed started).
+    [[nodiscard]] std::vector<NotifItem> TakeFresh() { std::lock_guard<std::mutex> l(m_mutex); std::vector<NotifItem> v; v.swap(m_fresh); return v; }
+    // Watches the database files and refreshes within ~0.2 s of a change (used by the bar for live toasts).
+    void StartWatching();
+    void StopWatching();
 
 private:
     void Work();
     mutable std::mutex m_mutex;
     std::vector<NotifItem> m_items;
     std::vector<long long> m_dismissed;
+    std::vector<NotifItem> m_fresh;
+    long long m_maxSeenId{-1};
+    bool m_primed{false};
     long long m_clearedBefore{0};
     std::atomic<bool> m_busy{false};
+    std::atomic<bool> m_again{false};
+    std::atomic<bool> m_watch{false};
+    std::thread m_watcher;
     std::atomic<bool> m_readable{true};
 };
 

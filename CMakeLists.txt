@@ -31,10 +31,11 @@ if(MSVC)
 endif()
 # bundled theme wallpapers live next to the executables
 add_custom_command(TARGET Aether POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/assets/wallpapers $<TARGET_FILE_DIR:Aether>/wallpapers)
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/assets/wallpapers $<TARGET_FILE_DIR:Aether>/wallpapers
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/assets/iconpacks $<TARGET_FILE_DIR:Aether>/iconpacks)
 
 # ---- Aether Bar: standalone taskbar replacement (separate exe, same rendering stack) ----------
-add_executable(AetherBar WIN32 bar/main.cpp bar/aether_bar.cpp bar/start_menu.cpp bar/tray_host.cpp bar/flyouts.cpp bar/weather.cpp bar/notifications.cpp bar/wifi.cpp bar/panels.cpp src/render/dcomp_layer.cpp src/render/context_menu.cpp assets/icons/aether.rc)
+add_executable(AetherBar WIN32 bar/main.cpp bar/aether_bar.cpp bar/start_menu.cpp bar/tray_host.cpp bar/flyouts.cpp bar/weather.cpp bar/notifications.cpp bar/toast_host.cpp bar/wifi.cpp bar/panels.cpp bar/window_preview.cpp src/render/dcomp_layer.cpp src/render/context_menu.cpp assets/icons/aether.rc)
 target_include_directories(AetherBar PRIVATE include third_party/json)
 target_link_libraries(AetherBar PRIVATE d3d11 dxgi d2d1 dwrite dcomp dwmapi shcore shell32 ole32 oleaut32 uuid powrprof advapi32 iphlpapi wlanapi ws2_32 winhttp secur32 windowscodecs shlwapi dxguid)
 if(MSVC)
@@ -91,6 +92,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E make_directory ${AETHER_STAGE}
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:Aether> $<TARGET_FILE:AetherBar> $<TARGET_FILE:AetherDesktop> $<TARGET_FILE:AetherExplorer> $<TARGET_FILE:AetherShell> $<TARGET_FILE:AetherBin> $<TARGET_FILE:AetherIntro> ${AETHER_STAGE}
     COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/assets/wallpapers ${AETHER_STAGE}/wallpapers
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/assets/iconpacks ${AETHER_STAGE}/iconpacks
     COMMAND ${CMAKE_COMMAND} -E chdir ${AETHER_STAGE} ${CMAKE_COMMAND} -E tar cf ${CMAKE_BINARY_DIR}/payload.zip --format=zip .
     DEPENDS Aether AetherBar AetherDesktop AetherExplorer AetherShell AetherBin AetherIntro
     VERBATIM)

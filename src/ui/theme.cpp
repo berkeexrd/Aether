@@ -34,13 +34,17 @@ void Theme::UseGlassTheme(int index) {
     render::glass::SetTheme(index);
     m_themeIndex = render::glass::ThemeIndex();
     const auto& t = render::glass::CurrentTheme();
-    const float br = t.bodyBot.r, bg = t.bodyBot.g, bb = t.bodyBot.b;
     const float ar = t.accent.r, ag = t.accent.g, ab = t.accent.b;
+    // The settings surface is built from the LIT colour of the theme with a breath of its accent (a deep violet, a deep blue ...),
+    // not from the near-black pill body, so the window reads as a coloured surface instead of a black box.
+    const bool oled0 = index == 1;
+    const float tint = oled0 ? 0.0f : (t.flat ? 0.05f : 0.13f);
+    const float br = t.bodyTop.r * (1.0f - tint) + ar * tint, bg = t.bodyTop.g * (1.0f - tint) + ag * tint, bb = t.bodyTop.b * (1.0f - tint) + ab * tint;
     auto lift = [&](float add, float accMix, float alpha = 1.0f) {
         return ImVec4(std::min(br + add + ar * accMix, 1.0f), std::min(bg + add + ag * accMix, 1.0f), std::min(bb + add + ab * accMix, 1.0f), alpha);
     };
     const bool oled = index == 1;
-    m_colors.Background = ImVec4(br * 0.75f, bg * 0.75f, bb * 0.75f, 1.0f);
+    m_colors.Background = ImVec4(br * 0.74f, bg * 0.74f, bb * 0.74f, 1.0f);      // bottom of the window gradient
     m_colors.Shell = oled ? ImVec4(0.02f, 0.02f, 0.025f, 1) : lift(0.012f, 0.0f);
     m_colors.Surface = lift(oled ? 0.045f : 0.030f, 0.004f);
     m_colors.SurfaceElevated = lift(oled ? 0.060f : 0.050f, 0.008f);
@@ -50,6 +54,9 @@ void Theme::UseGlassTheme(int index) {
     m_colors.Border = lift(0.110f, 0.020f);
     m_colors.BorderSubtle = lift(0.075f, 0.012f);
     m_colors.BorderHover = lift(0.200f, 0.040f);
+    m_colors.TextSecondary = ImVec4(0.80f, 0.80f, 0.87f, 1.0f);                   // the surface is lighter now: lift the greys a little
+    m_colors.TextMuted = ImVec4(0.61f, 0.61f, 0.70f, 1.0f);
+    m_colors.TextDisabled = ImVec4(0.42f, 0.42f, 0.51f, 1.0f);
     SetAccentColor(0xFF000000u | (static_cast<uint32_t>(ar * 255.0f + 0.5f) << 16) | (static_cast<uint32_t>(ag * 255.0f + 0.5f) << 8) | static_cast<uint32_t>(ab * 255.0f + 0.5f));
 }
 

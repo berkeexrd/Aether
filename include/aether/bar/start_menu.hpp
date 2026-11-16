@@ -107,6 +107,7 @@ private:
     ComPtr<ID2D1SolidColorBrush> m_brush;
 
     // data
+    unsigned m_packVer{0};                       // icon pack version the app icons were loaded for
     std::vector<App> m_apps;
     std::vector<std::wstring> m_pins;
     std::vector<int> m_pinnedIdx;               // pinned apps (indices into m_apps), in pin order

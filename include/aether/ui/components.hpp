@@ -3,6 +3,7 @@
 #include <imgui.h>
 #include <string>
 #include <functional>
+#include <vector>
 #include <cstdint>
 #include "aether/ui/theme.hpp"
 
@@ -30,6 +31,14 @@ namespace UI {
     bool SidebarItem(const char* id, const char* label, bool isSelected, float height = 40.0f, const char* iconUtf8 = nullptr);
     void StatusBadge(const char* label, const ImVec4& color);
     void Tooltip(const char* text);
+
+    // Feature search: every Section / SettingRow can be recorded without being drawn, so the search index always matches the real pages.
+    struct SearchEntry { int tab{0}; std::string section, label, desc; };
+    bool Capturing();                                                  // true while the feature-search index is being recorded (pages must not do real work then)
+    void BeginSearchCapture(std::vector<SearchEntry>* out, int tab);   // while active, rows are only recorded (their controls are not run)
+    void EndSearchCapture();
+    void FocusSetting(const std::string& section, const std::string& label);   // the next matching row scrolls into view and pulses
+    void TickSearchHighlight(float dt);
 
     // Toast notifications
     enum class ToastType { Success, Info, Warning, Error };

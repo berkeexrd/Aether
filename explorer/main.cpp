@@ -40,6 +40,7 @@
 #include "model.hpp"
 #include "archive.hpp"
 #include "netfs.hpp"
+#include "aether/core/crash.hpp"
 
 #ifndef DWMWA_WINDOW_CORNER_PREFERENCE
 #define DWMWA_WINDOW_CORNER_PREFERENCE 33
@@ -175,7 +176,7 @@ std::wstring UniqueName(const std::wstring& dir, const std::wstring& base, const
 enum class Op { Copy, Move, Delete, DeletePerm, Rename };
 
 void RunFileOp(HWND owner, Op op, std::vector<std::wstring> src, std::wstring dest, std::wstring newName, std::wstring selectAfter) {
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         {
             ComPtr<IFileOperation> fo;
@@ -252,6 +253,25 @@ void SetClipText(HWND hwnd, const std::wstring& t) {
     if (!OpenClipboard(hwnd)) { GlobalFree(h); return; }
     EmptyClipboard(); SetClipboardData(CF_UNICODETEXT, h); CloseClipboard();
 }
+// A .lnk pointing at `target`, written to `lnkPath`.
+bool MakeShortcut(const std::wstring& target, const std::wstring& lnkPath) {
+    ComPtr<IShellLinkW> sl;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl))) || !sl) return false;
+    sl->SetPath(target.c_str());
+    const size_t k = target.find_last_of(L'\\');
+    if (k != std::wstring::npos && k > 0) sl->SetWorkingDirectory(target.substr(0, k).c_str());
+    ComPtr<IPersistFile> pf;
+    return SUCCEEDED(sl.As(&pf)) && pf && SUCCEEDED(pf->Save(lnkPath.c_str(), TRUE));
+}
+std::wstring GetClipText(HWND hwnd) {
+    std::wstring out;
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT) || !OpenClipboard(hwnd)) return out;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (const wchar_t* t = static_cast<const wchar_t*>(GlobalLock(h))) { out = t; GlobalUnlock(h); }
+    }
+    CloseClipboard();
+    return out;
+}
 ComPtr<IDataObject> MakeDataObject(const std::vector<std::wstring>& paths) {
     ComPtr<IDataObject> d;
     std::vector<PIDLIST_ABSOLUTE> ids;
@@ -291,7 +311,7 @@ struct ThumbQueue {
     void Clear() { std::lock_guard<std::mutex> l(m); q.clear(); }
     void Push(HWND h, const std::wstring& path, int px) {
         { std::lock_guard<std::mutex> l(m); q.emplace_back(path, px); hwnd = h; }
-        if (!started) { started = true; std::thread([this] { Run(); }).detach(); }
+        if (!started) { started = true; ::aether::core::SafeThread("bg", [this] { Run(); }).detach(); }
         cv.notify_one();
     }
     void Run() {
@@ -472,6 +492,7 @@ private:
     void TogglePin(const std::wstring& path);
     bool IsPinned(const std::wstring& path) const;
     void OpenTerminal(const std::wstring& dir);
+    bool RunTypedCommand(const std::wstring& typed);    // address bar: a program name starts that program in the current folder
     void BreadcrumbMenu(int crumbIndex, POINT pt);
     void NewFile(const std::wstring& base, const std::wstring& ext);
     void TxtWrap(const std::wstring& s, const Rect& r, float size, int weight, const Color& c);
@@ -570,8 +591,14 @@ private:
     enum { E_None = 0, E_Search, E_Path, E_Rename };
     int m_edit{E_None};
     std::wstring m_editText, m_search;
-    bool m_editAll{false};                       // Ctrl+A / fresh edit: the whole text is selected, the next key replaces it
-    float EditW(float size);
+    int m_caret{0}, m_editAnchor{0};                 // caret and selection anchor inside m_editText; the selection is [min, max)
+    [[nodiscard]] bool HasSel() const { return m_caret != m_editAnchor; }
+    float EditX(float size, int pos);            // x offset of a character position inside the edit text
+    void EditReplaceSel(const std::wstring& with);
+    void EditMoveTo(int pos, bool extend);
+    int EditWordStep(int from, int dir) const;
+    void DrawEditSel(float x, float y, float h, float size, float maxX, float rad, const Color& col);
+    void DrawEditCaret(float x, float y, float h, float size, float maxX, const Color& col);
     int m_renameIndex{-1};
 
     // icon cache
@@ -1244,7 +1271,7 @@ void Explorer::ChipIcon(int kind, const Rect& r, const Color& c) {
 }
 
 void Explorer::DrawFileGlyph(const FileEntry& e, const std::wstring& fullPath, const Rect& r) {
-    if (e.dir) { Icon(K_Folder, r); return; }
+    if (e.dir) { Icon(!m_home && IsNetRoot(m_path) ? K_PC : K_Folder, r); return; }          // computers of the network get the PC icon
     const std::wstring& x = e.ext;
     auto in = [&](std::initializer_list<const wchar_t*> l) { for (auto* p : l) if (x == p) return true; return false; };
     if (in({L".png", L".jpg", L".jpeg", L".gif", L".webp", L".bmp", L".svg", L".ico", L".heic", L".tif", L".tiff"}) && x != L".ico") { Icon(K_Pictures, r); return; }
@@ -1308,7 +1335,7 @@ void Explorer::StartFolderLoad() {
     m_loading = true;
     const HWND hwnd = m_hwnd;
     const std::wstring path = m_path;
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         auto* r = new FolderResult();
         r->gen = gen; r->path = path;
         r->ok = EnumerateFolder(path, *r);
@@ -1320,7 +1347,7 @@ void Explorer::StartHomeLoad() {
     const HWND hwnd = m_hwnd;
     std::vector<std::wstring> paths;
     for (const auto& q : m_quick) paths.push_back(q.path);
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         auto* d = new HomeData();
         d->userName = UserDisplayName();
@@ -1520,7 +1547,7 @@ void Explorer::Compress(int kind) {
     const std::wstring out = UniqueName(dir, stem, kind == 1 ? L".7z" : kind == 2 ? L".tar.gz" : L".zip");
     std::vector<std::wstring> names;
     for (const auto& f : p) names.push_back(f.substr(f.find_last_of(L'\\') + 1));
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         PostXfer(hwnd, L"Sıkıştırılıyor: " + out);
         const bool ok = CompressTo(kind, dir, names, JoinPath(dir, out));
         PostXfer(hwnd, ok ? L"" : (kind == 1 ? L"Sıkıştırılamadı (7-Zip gerekli)" : L"Sıkıştırılamadı"));
@@ -1530,7 +1557,7 @@ void Explorer::Compress(int kind) {
 void Explorer::Upload() {
     if (m_home || IsNetRoot(m_path) || IsUncServer(m_path)) return;
     const HWND hwnd = m_hwnd; const std::wstring dir = m_path;
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         std::vector<std::wstring> files;
         {
@@ -1570,16 +1597,60 @@ void Explorer::ShowProperties() {
 }
 
 // ---- editing ------------------------------------------------------------------------------------------------------
-float Explorer::EditW(float size) {
+float Explorer::EditX(float size, int pos) {
+    pos = std::clamp(pos, 0, static_cast<int>(m_editText.size()));
+    if (pos == 0) return 0.0f;
+    const std::wstring part = m_editText.substr(0, static_cast<size_t>(pos));
     ComPtr<IDWriteTextLayout> lay; float w = 0;
-    if (!m_editText.empty() && SUCCEEDED(m_dcomp->GetDWriteFactory()->CreateTextLayout(m_editText.c_str(), static_cast<UINT32>(m_editText.size()), Fmt(size, 400, 0, false), 4000, 30, &lay)) && lay) {
+    if (SUCCEEDED(m_dcomp->GetDWriteFactory()->CreateTextLayout(part.c_str(), static_cast<UINT32>(part.size()), Fmt(size, 400, 0, false), 4000, 30, &lay)) && lay) {
         DWRITE_TEXT_METRICS tm{}; lay->GetMetrics(&tm); w = tm.widthIncludingTrailingWhitespace;
     }
     return w;
 }
 
+void Explorer::DrawEditSel(float x, float y, float h, float size, float maxX, float rad, const Color& col) {
+    if (!HasSel()) return;
+    const float x0 = x + EditX(size, std::min(m_caret, m_editAnchor)), x1 = std::min(x + EditX(size, std::max(m_caret, m_editAnchor)), maxX);
+    if (x1 > x0) FillRR(Rect{x0, y, x1 - x0, h}, rad, WithA(col, 0.45f));
+}
+
+void Explorer::DrawEditCaret(float x, float y, float h, float size, float maxX, const Color& col) {
+    if ((GetTickCount64() / 500) % 2 != 0) return;
+    FillRR(Rect{std::min(x + EditX(size, m_caret), maxX), y, 1.5f, h}, 0.5f, col);
+}
+
+// Ctrl+Left / Ctrl+Right / Ctrl+Backspace: to the start of the previous word / the start of the next one.
+int Explorer::EditWordStep(int from, int dir) const {
+    const int n = static_cast<int>(m_editText.size());
+    auto sep = [&](int i) { const wchar_t c = m_editText[static_cast<size_t>(i)]; return c == L' ' || c == L'\\' || c == L'/' || c == L'.' || c == L'_' || c == L'-'; };
+    int i = std::clamp(from, 0, n);
+    if (dir < 0) { while (i > 0 && sep(i - 1)) --i; while (i > 0 && !sep(i - 1)) --i; }
+    else         { while (i < n && !sep(i)) ++i; while (i < n && sep(i)) ++i; }
+    return i;
+}
+
+void Explorer::EditReplaceSel(const std::wstring& with) {
+    const int lo = std::min(m_caret, m_editAnchor), hi = std::max(m_caret, m_editAnchor);
+    m_editText.replace(static_cast<size_t>(lo), static_cast<size_t>(hi - lo), with);
+    m_caret = m_editAnchor = lo + static_cast<int>(with.size());
+    if (m_edit == E_Search) { m_search = m_editText; RebuildView(); m_scroll = m_scrollTarget = 0; }
+    Kick();
+}
+
+void Explorer::EditMoveTo(int pos, bool extend) {
+    m_caret = std::clamp(pos, 0, static_cast<int>(m_editText.size()));
+    if (!extend) m_editAnchor = m_caret;
+    Kick();
+}
+
 void Explorer::BeginEdit(int target, const std::wstring& text) {
-    m_edit = target; m_editText = text; m_editAll = target != E_Search && !text.empty();
+    m_edit = target; m_editText = text;
+    m_caret = static_cast<int>(text.size());
+    m_editAnchor = (target != E_Search && !text.empty()) ? 0 : m_caret;      // a fresh path / rename edit starts fully selected
+    if (target == E_Rename && m_renameIndex >= 0 && m_renameIndex < static_cast<int>(m_view.size()) && !m_items[m_view[m_renameIndex]].dir) {
+        const size_t dot = text.find_last_of(L'.');                      // like Explorer: only the name is selected, not the extension
+        if (dot != std::wstring::npos && dot > 0) m_caret = static_cast<int>(dot);
+    }
     SetTimer(m_hwnd, kTimerCaret, 500, nullptr);
     Kick();
 }
@@ -1607,6 +1678,7 @@ void Explorer::CommitEdit() {
             if (p.empty() || IEquals(p, L"Bu Bilgisayar")) Navigate(L"");
             else if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) OpenPath(p);
             else if (p.size() > 2 && p[0] == L'\\' && p[1] == L'\\') Navigate(p);                       // \\server or \\server\share
+            else if (RunTypedCommand(p)) {}                                                             // "cmd", "powershell", "notepad" ... run in this folder, like Explorer
             else if (p.find(L'\\') == std::wstring::npos && p.find(L'.') != std::wstring::npos && p.find(L':') == std::wstring::npos)
                 Navigate(L"ftp://" + p);                                                                // bare host name
         }
@@ -1630,13 +1702,19 @@ void Explorer::CommitEdit() {
 
 void Explorer::OnChar(wchar_t c) {
     if (m_edit != E_None) {
-        if (m_editAll && (c == 8 || (c >= 32 && c != 127))) { m_editText.clear(); m_editAll = false; if (c == 8) { if (m_edit == E_Search) { m_search.clear(); RebuildView(); } Kick(); return; } }
-        if (c == 8) { if (!m_editText.empty()) m_editText.pop_back(); }
-        else if (c == 13) { CommitEdit(); return; }
-        else if (c == 27) { CancelEdit(); return; }
-        else if (c >= 32 && c != 127) m_editText += c;
-        if (m_edit == E_Search) { m_search = m_editText; RebuildView(); m_scroll = m_scrollTarget = 0; }
-        Kick();
+        if (c == 27) { CancelEdit(); return; }
+        if (c == 13) { CommitEdit(); return; }
+        if (c == 8) {                                                   // Backspace: the selection, or the character before the caret
+            if (!HasSel() && m_caret > 0) m_editAnchor = m_caret - 1;
+            if (HasSel()) EditReplaceSel(L""); else Kick();
+            return;
+        }
+        if (c == 127) {                                                 // Ctrl+Backspace arrives as DEL: delete the previous word
+            if (!HasSel()) m_editAnchor = EditWordStep(m_caret, -1);
+            if (HasSel()) EditReplaceSel(L""); else Kick();
+            return;
+        }
+        if (c >= 32) EditReplaceSel(std::wstring(1, c));                // other control characters (Ctrl+A, Ctrl+C ...) are handled in OnKey
         return;
     }
     // type-ahead in the file list
@@ -1656,16 +1734,31 @@ void Explorer::OnChar(wchar_t c) {
 void Explorer::OnKey(WPARAM vk) {
     const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0, alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
     if (ctrl && !alt && vk == 'A' && !m_about) {                          // Ctrl+A: select all — in an edit box the text, otherwise every entry
-        if (m_edit != E_None) { m_editAll = !m_editText.empty(); Kick(); return; }
+        if (m_edit != E_None) { m_editAnchor = 0; m_caret = static_cast<int>(m_editText.size()); Kick(); return; }
         if (!m_home) { std::fill(m_sel.begin(), m_sel.end(), 1); if (m_cursor < 0 && !m_view.empty()) m_cursor = 0; Kick(); }
         return;
     }
     if (vk == VK_F1) { m_about = !m_about; Kick(); return; }
     if (m_about) { if (vk == VK_ESCAPE || vk == VK_RETURN) m_about = false; Kick(); return; }
     if (m_edit != E_None) {
+        const int len = static_cast<int>(m_editText.size());
+        const std::wstring selText = HasSel() ? m_editText.substr(static_cast<size_t>(std::min(m_caret, m_editAnchor)), static_cast<size_t>(std::abs(m_caret - m_editAnchor))) : std::wstring();
         if (vk == VK_ESCAPE) CancelEdit();
-        else if (vk == VK_DELETE && m_editAll) { m_editText.clear(); m_editAll = false; if (m_edit == E_Search) { m_search.clear(); RebuildView(); } Kick(); }
-        else if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_HOME || vk == VK_END) { m_editAll = false; Kick(); }
+        else if (ctrl && (vk == 'C' || vk == VK_INSERT)) { if (!selText.empty()) SetClipText(m_hwnd, selText); }
+        else if (ctrl && vk == 'X') { if (!selText.empty()) { SetClipText(m_hwnd, selText); EditReplaceSel(L""); } }
+        else if ((ctrl && vk == 'V') || (shift && vk == VK_INSERT)) {
+            std::wstring t = GetClipText(m_hwnd);
+            t.erase(std::remove_if(t.begin(), t.end(), [](wchar_t ch) { return ch < 32; }), t.end());   // one line only
+            if (!t.empty()) EditReplaceSel(t);
+        }
+        else if (vk == VK_DELETE) {
+            if (!HasSel() && m_caret < len) m_editAnchor = ctrl ? EditWordStep(m_caret, 1) : m_caret + 1;
+            if (HasSel()) EditReplaceSel(L""); else Kick();
+        }
+        else if (vk == VK_LEFT)  { if (HasSel() && !shift && !ctrl) EditMoveTo(std::min(m_caret, m_editAnchor), false); else EditMoveTo(ctrl ? EditWordStep(m_caret, -1) : m_caret - 1, shift); }
+        else if (vk == VK_RIGHT) { if (HasSel() && !shift && !ctrl) EditMoveTo(std::max(m_caret, m_editAnchor), false); else EditMoveTo(ctrl ? EditWordStep(m_caret, 1) : m_caret + 1, shift); }
+        else if (vk == VK_HOME) EditMoveTo(0, shift);
+        else if (vk == VK_END) EditMoveTo(len, shift);
         return;      // text goes through WM_CHAR
     }
     if (alt && vk == VK_LEFT) { GoBack(); return; }
@@ -1954,6 +2047,9 @@ void Explorer::ContextMenu(int id, POINT pt) {
         if (!multi) items.push_back(MenuItem(5, L"Yeniden adlandır", bui::kGlyphRename, false, L"F2"));
         if (!multi && !e.dir && IsArchiveExt(e.ext)) items.push_back(MenuItem(20, L"Arşiv işlemleri", 0xE8B7));
         items.push_back(MenuItem(6, L"Sıkıştır", 0xF012));
+        items.push_back(MenuItem(22, L"Kısayol oluştur", 0xE71B));
+        items.push_back(MenuItem(23, L"Gönder", 0xE724));
+        if (!e.dir && !multi) items.push_back(MenuItem(21, L"Birlikte aç...", 0xE8A7));
         items.push_back(MenuSeparator());
         items.push_back(MenuItem(7, L"Yolu kopyala", bui::kGlyphCopy, false, L"Ctrl+Shift+C"));
         if (e.dir && !multi) { items.push_back(MenuItem(8, L"Terminalde aç", 0xE756)); items.push_back(MenuItem(9, IsPinned(full) ? L"Sabitlemeyi kaldır" : L"Hızlı erişime sabitle", bui::kGlyphPin)); }
@@ -1993,6 +2089,26 @@ void Explorer::ContextMenu(int id, POINT pt) {
             case 13: ShellMenu(SelectedPaths(), pt); break;
             case 15: m_pendingSelect = e.name; Navigate(e.parent); break;
             case 16: ShellExecuteW(m_hwnd, L"runas", full.c_str(), nullptr, e.parent.empty() ? m_path.c_str() : e.parent.c_str(), SW_SHOWNORMAL); break;
+            case 21: ShellExecuteW(m_hwnd, L"openas", full.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
+            case 22: {
+                const std::wstring dir = e.parent.empty() ? m_path : e.parent;
+                std::wstring stem = e.name; const size_t d = stem.find_last_of(L'.'); if (d != std::wstring::npos && d > 0 && !e.dir) stem = stem.substr(0, d);
+                const std::wstring nm = UniqueName(dir, stem + L" - Kısayol", L".lnk");
+                if (MakeShortcut(full, JoinPath(dir, nm))) { m_pendingSelect = nm; Refresh(); }
+                break;
+            }
+            case 23: {
+                const int k = aether::ui::ShowContextMenu({MenuItem(1, L"Masaüstü (kısayol oluştur)", 0xE8FC), MenuItem(2, L"Sıkıştırılmış klasör (.zip)", 0xF012)}, pt);
+                if (k == 1) {
+                    PWSTR desk = nullptr;
+                    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desk)) && desk) {
+                        const std::wstring dd = desk; CoTaskMemFree(desk);
+                        std::wstring stem = e.name; const size_t d = stem.find_last_of(L'.'); if (d != std::wstring::npos && d > 0 && !e.dir) stem = stem.substr(0, d);
+                        MakeShortcut(full, JoinPath(dd, UniqueName(dd, stem, L".lnk")));
+                    }
+                } else if (k == 2) Compress(0);
+                break;
+            }
         }
         return;
     }
@@ -2031,7 +2147,8 @@ void Explorer::ContextMenu(int id, POINT pt) {
     }
     items = {MenuItem(10, L"Yeni klasör", bui::kGlyphNewFolder, false, L"Ctrl+Shift+N"), MenuItem(11, L"Yeni metin belgesi", bui::kGlyphDocument), MenuItem(12, L"Yapıştır", bui::kGlyphPaste, false, L"Ctrl+V"),
              MenuSeparator(), MenuItem(13, L"Görünüm", bui::kGlyphView), MenuItem(14, L"Sırala", bui::kGlyphSort), MenuItem(15, m_showHidden ? L"Gizli öğeleri gizle" : L"Gizli öğeleri göster", 0, false, L"Ctrl+H"),
-             MenuSeparator(), MenuItem(16, L"Yenile", bui::kGlyphRefresh, false, L"F5"), MenuItem(17, L"Terminalde aç", 0xE756), MenuItem(18, L"Yolu kopyala", bui::kGlyphCopy),
+             MenuItem(21, L"Tümünü seç", 0xE8B3, false, L"Ctrl+A"), MenuItem(22, L"Seçimi ters çevir", 0xE8B3),
+             MenuSeparator(), MenuItem(16, L"Yenile", bui::kGlyphRefresh, false, L"F5"), MenuItem(17, L"Terminalde aç", 0xE756), MenuItem(23, L"Terminalde aç (yönetici)", 0xE7EF), MenuItem(18, L"Yolu kopyala", bui::kGlyphCopy),
              MenuSeparator(), MenuItem(19, L"Özellikler", bui::kGlyphInfo), MenuItem(20, L"Diğer seçenekler (Windows menüsü)", 0xE712)};
     items[2].enabled = IsClipboardFormatAvailable(CF_HDROP) != 0 || (!m_ftpClip.empty() && GetClipboardSequenceNumber() == m_ftpClipSeq);
     const int c = aether::ui::ShowContextMenu(items, pt);
@@ -2047,6 +2164,9 @@ void Explorer::ContextMenu(int id, POINT pt) {
         case 18: SetClipText(m_hwnd, m_path); break;
         case 19: ShowProperties(); break;
         case 20: ShellMenu({m_path}, pt); break;
+        case 21: std::fill(m_sel.begin(), m_sel.end(), 1); if (m_cursor < 0 && !m_view.empty()) m_cursor = 0; Kick(); break;
+        case 22: for (auto& v : m_sel) v = v ? 0 : 1; Kick(); break;
+        case 23: ShellExecuteW(m_hwnd, L"runas", L"cmd.exe", nullptr, m_path.c_str(), SW_SHOWNORMAL); break;
     }
 }
 
@@ -2116,7 +2236,7 @@ void Explorer::AddMenu(POINT pt) {
 }
 void Explorer::StartTransfer(std::vector<std::wstring> srcs, std::wstring dest, bool move) {
     const HWND hwnd = m_hwnd;
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         const bool ok = TransferItems(srcs, dest, move, [hwnd](const std::wstring& t) { PostXfer(hwnd, t); });
         PostXfer(hwnd, ok ? L"" : L"Bazı öğeler aktarılamadı");
         PostOpDone(hwnd, L"");
@@ -2124,7 +2244,7 @@ void Explorer::StartTransfer(std::vector<std::wstring> srcs, std::wstring dest, 
 }
 void Explorer::RemoteOp(const std::wstring& anyUrl, std::function<bool(FtpClient&)> fn, const std::wstring& sel) {
     const HWND hwnd = m_hwnd;
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         FtpClient c;
         const bool ok = c.Open(anyUrl) && fn(c);
         PostXfer(hwnd, ok ? L"" : L"İşlem sunucuda başarısız oldu");
@@ -2133,7 +2253,7 @@ void Explorer::RemoteOp(const std::wstring& anyUrl, std::function<bool(FtpClient
 }
 void Explorer::OpenRemoteFile(const std::wstring& url) {
     const HWND hwnd = m_hwnd;
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         const std::wstring leaf = LeafOf(url);
         PostXfer(hwnd, L"İndiriliyor: " + leaf);
         wchar_t tmp[MAX_PATH] = {}; GetTempPathW(MAX_PATH, tmp);
@@ -2162,7 +2282,7 @@ void Explorer::BrowseArchive(const std::wstring& arc) {
     wchar_t ks[32]; swprintf(ks, 32, L"%zx", key);
     std::wstring stem = LeafOf(arc); const size_t d = stem.find_last_of(L'.'); if (d != std::wstring::npos && d > 0) stem.erase(d);
     const std::wstring dir = JoinPath(JoinPath(tmp, L"AetherArc"), stem + L"_" + ks);
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         bool have = false;
         {
             WIN32_FIND_DATAW fd;
@@ -2195,7 +2315,7 @@ void Explorer::ExtractArchiveCmd(const std::wstring& arc, bool intoFolder) {
     if (ExtOf(stem) == L".tar") stem.erase(stem.size() - 4);
     const std::wstring folder = intoFolder ? UniqueName(parent, stem, L"") : L"";
     const std::wstring dest = intoFolder ? JoinPath(parent, folder) : parent;
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         PostXfer(hwnd, L"Çıkarılıyor: " + LeafOf(arc));
         std::wstring tool;
         const bool ok = ExtractArchive(arc, dest, tool);
@@ -2512,7 +2632,7 @@ void Explorer::StartWatch() {
     if (!stop) return;
     m_watchStop = stop;
     const HWND hwnd = m_hwnd; const std::wstring path = m_path;
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         HANDLE h = FindFirstChangeNotificationW(path.c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
                                                 FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_ATTRIBUTES);
         if (h != INVALID_HANDLE_VALUE) {
@@ -2537,7 +2657,7 @@ void Explorer::StartDeepSearch() {
     const uint32_t gen = ++m_gen;
     m_loading = true;
     const HWND hwnd = m_hwnd; const std::wstring root = m_path, q = m_search; const bool hid = m_showHidden;
-    std::thread([=, this]() {
+    ::aether::core::SafeThread("bg", [=, this]() {
         auto* r = new FolderResult();
         r->gen = gen; r->path = root; r->deep = true;
         DeepSearch(root, q, m_gen, gen, hid, *r);
@@ -2580,7 +2700,7 @@ void Explorer::StartInfo(const std::wstring& path) {
     const uint32_t gen = ++m_infoGen;
     m_infoPath = path; m_infoCount = -1; m_infoSize = 0; m_infoBusy = true;
     const HWND hwnd = m_hwnd;
-    std::thread([=, this]() {
+    ::aether::core::SafeThread("bg", [=, this]() {
         auto* r = new InfoResult();
         r->path = path; r->gen = gen;
         FolderStats(path, m_infoGen, gen, r->count, r->size);
@@ -2592,6 +2712,26 @@ void Explorer::OnInfo(InfoResult* r) {
     if (res->gen != m_infoGen.load()) return;
     m_infoCount = res->count; m_infoSize = res->size; m_infoBusy = false;
     Kick();
+}
+
+// Typing "cmd" (or "powershell", "wt", "notepad", "regedit" ...) into the address bar runs it with the current folder as working directory.
+bool Explorer::RunTypedCommand(const std::wstring& typed) {
+    if (typed.empty() || typed.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) return false;
+    std::wstring dir = m_path;
+    if (m_home || dir.empty() || IsVirtualPath(dir) || IsFtp(dir) || GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        wchar_t prof[MAX_PATH] = {};
+        GetEnvironmentVariableW(L"USERPROFILE", prof, MAX_PATH);
+        dir = prof;
+    }
+    const std::wstring l = Lower(typed);
+    if (l == L"wt" || l == L"terminal" || l == L"terminal:") { OpenTerminal(dir); return true; }
+    if (l == L"cmd" || l == L"cmd.exe") {
+        ShellExecuteW(m_hwnd, L"open", L"cmd.exe", nullptr, dir.c_str(), SW_SHOWNORMAL);
+        return true;
+    }
+    wchar_t found[MAX_PATH * 2] = {};
+    if (!SearchPathW(nullptr, typed.c_str(), L".exe", MAX_PATH * 2, found, nullptr)) return false;
+    return reinterpret_cast<INT_PTR>(ShellExecuteW(m_hwnd, L"open", found, nullptr, dir.c_str(), SW_SHOWNORMAL)) > 32;
 }
 
 void Explorer::OpenTerminal(const std::wstring& dir) {
@@ -2947,20 +3087,23 @@ void Explorer::DrawSidebar(float H) {
             const Rect cr{10, y, kSideW - 20, 34};
             if (act) { FillRR(cr, 12, WithA(vl, 0.22f)); StrokeRR(cr, 12, WithA(vl, 0.4f)); }
             else FillRR(cr, 12, WithA(vl, 0.13f * Hover(id)));
-            Glyph(0xE839, Rect{cr.x + 38, y, 22, 34}, 14.0f, Mix(vl, kWhite, 0.25f));
-            Txt(c.name, Rect{cr.x + 70, y, cr.width - 78, 34}, 13.5f, act ? 600 : 400, kWhite);
+            Glyph(0xE839, Rect{cr.x + 42, y, 22, 34}, 14.0f, Mix(vl, kWhite, act ? 0.6f : 0.25f));
+            Txt(c.name, Rect{cr.x + 76, y, cr.width - 84, 34}, 13.5f, act ? 600 : 400, kWhite);
             Hit(cr, id);
             y += 36;
         }
         if (y + 36 * 2 <= lim) {
             const Rect ar{10, y, kSideW - 20, 34};
-            FillRR(ar, 12, WithA(vl, 0.13f * Hover(H_SideConnAdd)));
-            Glyph(0xE710, Rect{ar.x + 38, y, 22, 34}, 12.0f, WithA(muted, 0.95f));
-            Txt(L"Bağlantı ekle", Rect{ar.x + 70, y, ar.width - 78, 34}, 13.0f, 400, muted);
+            const float ah = Hover(H_SideConnAdd);
+            FillRR(ar, 12, WithA(vl, 0.13f * ah));
+            FillRR(Rect{ar.x + 45, y + 11, 16, 16}, 8, WithA(vl, 0.16f + 0.20f * ah));              // small round "+" badge
+            Glyph(0xE710, Rect{ar.x + 45, y + 11, 16, 16}, 9.0f, Mix(muted, vl, 0.45f + 0.4f * ah));
+            Txt(L"Bağlantı ekle", Rect{ar.x + 76, y, ar.width - 84, 34}, 13.0f, 400, Mix(muted, kWhite, ah * 0.6f));
             Hit(ar, H_SideConnAdd);
             y += 36;
         }
-        if (y + 36 <= lim) {
+        if (y + 36 + 6 <= lim) {
+            y += 2; hline();                                    // Linux is its own location, not a child of "Ağ"
             const Rect r2{10, y, kSideW - 20, 34};
             FillRR(r2, 12, WithA(vl, 0.13f * Hover(H_SideLinux)));
             Icon(K_Linux, Rect{r2.x + 26, y + 6, 20, 22});
@@ -3018,15 +3161,9 @@ void Explorer::DrawToolbar(float W) {
         Glyph(bui::kGlyphChevronRight, Rect{r.x + 12, r.y, 20, h}, 11.0f, text);
         const float tx = r.x + 40, tw = r.width - 90;
         if (m_edit == E_Path) {
-            if (m_editAll && !m_editText.empty()) FillRR(Rect{tx - 2, r.y + 8, std::min(EditW(13.0f) + 4, tw), h - 16}, 4, WithA(vl, 0.4f));
+            DrawEditSel(tx, r.y + 8, h - 16, 13.0f, tx + tw, 4, vl);
             Txt(m_editText, Rect{tx, r.y, tw, h}, 13.0f, 400, text);
-            if ((GetTickCount64() / 500) % 2 == 0) {
-                ComPtr<IDWriteTextLayout> lay; float w = 0;
-                if (SUCCEEDED(m_dcomp->GetDWriteFactory()->CreateTextLayout(m_editText.c_str(), static_cast<UINT32>(m_editText.size()), Fmt(13.0f, 400, 0, false), 4000, 30, &lay)) && lay) {
-                    DWRITE_TEXT_METRICS tm{}; lay->GetMetrics(&tm); w = tm.widthIncludingTrailingWhitespace;
-                }
-                FillRR(Rect{tx + std::min(w, tw - 2), r.y + 10, 1.5f, h - 20}, 0.5f, vl);
-            }
+            DrawEditCaret(tx, r.y + 10, h - 20, 13.0f, tx + tw - 2, vl);
         } else {
             std::vector<std::wstring> labels{L"Bu Bilgisayar"};
             if (!m_home) {
@@ -3082,15 +3219,10 @@ void Explorer::DrawToolbar(float W) {
         Card(r, h * 0.5f, m_edit == E_Search ? 0.7f : Hover(H_Search) * 0.5f, 0.9f);
         Glyph(bui::kGlyphSearch, Rect{r.x + 8, r.y, 32, h}, 14.0f, text);
         const std::wstring& shown = m_edit == E_Search ? m_editText : m_search;
+        if (m_edit == E_Search) DrawEditSel(r.x + 44, r.y + 8, h - 16, 13.0f, r.x + 44 + r.width - 56, 4, vl);
         if (shown.empty()) Txt(m_home ? L"Bu bilgisayarda ara..." : L"Bu klasörde ara...", Rect{r.x + 44, r.y, r.width - 56, h}, 12.5f, 400, WithA(muted, 0.95f));
         else Txt(shown, Rect{r.x + 44, r.y, r.width - 56, h}, 13.0f, 400, text);
-        if (m_edit == E_Search && (GetTickCount64() / 500) % 2 == 0) {
-            ComPtr<IDWriteTextLayout> lay; float tw = 0;
-            if (SUCCEEDED(m_dcomp->GetDWriteFactory()->CreateTextLayout(shown.c_str(), static_cast<UINT32>(shown.size()), Fmt(13.0f, 400, 0, false), 4000, 30, &lay)) && lay) {
-                DWRITE_TEXT_METRICS tm{}; lay->GetMetrics(&tm); tw = tm.widthIncludingTrailingWhitespace;
-            }
-            FillRR(Rect{r.x + 44 + std::min(tw, r.width - 60), r.y + 10, 1.5f, h - 20}, 0.5f, vl);
-        }
+        if (m_edit == E_Search) DrawEditCaret(r.x + 44, r.y + 10, h - 20, 13.0f, r.x + 44 + r.width - 60, vl);
         Hit(r, H_Search);
     }
     if (m_loading) {
@@ -3544,8 +3676,16 @@ void Explorer::DrawFolder(float W, float H) {
 
     if (n == 0) {
         const wchar_t* msg = m_loading ? (m_deep || !m_search.empty() ? L"Aranıyor…" : L"Yükleniyor…") : (m_loadFailed ? L"Bu konuma erişilemedi" : (m_search.empty() ? L"Bu klasör boş" : L"Eşleşen öğe yok"));
-        Glyph(m_loadFailed ? bui::kGlyphLock : bui::kGlyphFolder, Rect{view.x, view.y + 50, view.width - prevW * 0, 60}, 40.0f, WithA(vl, 0.5f));
+        const bool netEmpty = !m_home && !m_loading && !m_deep && m_search.empty() && (IsNetRoot(m_path) || IsUncServer(m_path));
+        if (netEmpty) {
+            msg = IsNetRoot(m_path) ? (m_loadFailed ? L"Ağ taranamadı" : L"Ağda bilgisayar bulunamadı") : (m_loadFailed ? L"Bu bilgisayara erişilemedi" : L"Paylaşılan klasör bulunamadı");
+        }
+        Glyph(netEmpty ? 0xE774 : (m_loadFailed ? bui::kGlyphLock : bui::kGlyphFolder), Rect{view.x, view.y + 50, view.width - prevW * 0, 60}, 40.0f, WithA(vl, 0.5f));
         Txt(msg, Rect{view.x, view.y + 118, view.width, 28}, 15, 500, muted, 1);
+        if (netEmpty) {
+            Txt(L"Ağ bulma kapalı olabilir. Adres çubuğuna \\\\sunucu yazın,", Rect{view.x, view.y + 150, view.width, 22}, 12.5f, 400, WithA(muted, 0.85f), 1);
+            Txt(L"sağ tıklayıp bir FTP bağlantısı ekleyin veya ağ sürücüsü bağlayın.", Rect{view.x, view.y + 172, view.width, 22}, 12.5f, 400, WithA(muted, 0.85f), 1);
+        }
     }
     const int firstRow = std::max(0, static_cast<int>(std::floor(m_scroll / m_cellH)));
     const int lastRow = static_cast<int>(std::ceil((m_scroll + m_viewH) / m_cellH));
@@ -3587,26 +3727,22 @@ void Explorer::DrawFolder(float W, float H) {
             if (m_edit == E_Rename && m_renameIndex == i) {
                 const Rect er{r.x + 2, ic.Bottom() + 6, r.width - 4, 24};
                 FillRR(er, 8, Color{0, 0, 0, 0.5f}); StrokeRR(er, 8, vl, 1.5f);
-                if (m_editAll && !m_editText.empty()) FillRR(Rect{er.x + 4, er.y + 4, std::min(EditW(12.0f) + 4, er.width - 8), er.height - 8}, 3, WithA(vl, 0.45f));
+                DrawEditSel(er.x + 6, er.y + 4, er.height - 8, 12.0f, er.x + er.width - 6, 3, vl);
                 Txt(m_editText, Rect{er.x + 6, er.y, er.width - 12, er.height}, 12, 400, kWhite);
+                DrawEditCaret(er.x + 6, er.y + 5, er.height - 10, 12.0f, er.x + er.width - 8, vl);
             } else TxtWrap(e.name, Rect{r.x + 4, ic.Bottom() + 6, r.width - 8, 36}, 12, sel ? 600 : 400, sel ? kWhite : text);
         } else {
             DrawFileGlyph(e, full, Rect{r.x + 16, r.y + 3, 28, 28});
             if (m_edit == E_Rename && m_renameIndex == i) {
                 const Rect er{r.x + 52, r.y + 3, nameW - 52, r.height - 6};
                 FillRR(er, 8, Color{0, 0, 0, 0.45f}); StrokeRR(er, 8, vl, 1.5f);
-                if (m_editAll && !m_editText.empty()) FillRR(Rect{er.x + 6, er.y + 4, std::min(EditW(13.5f) + 4, er.width - 12), er.height - 8}, 3, WithA(vl, 0.45f));
+                DrawEditSel(er.x + 8, er.y + 4, er.height - 8, 13.5f, er.x + er.width - 8, 3, vl);
                 Txt(m_editText, Rect{er.x + 8, er.y, er.width - 16, er.height}, 13.5f, 400, kWhite);
-                if ((GetTickCount64() / 500) % 2 == 0) {
-                    ComPtr<IDWriteTextLayout> lay; float tw = 0;
-                    if (SUCCEEDED(m_dcomp->GetDWriteFactory()->CreateTextLayout(m_editText.c_str(), static_cast<UINT32>(m_editText.size()), Fmt(13.5f, 400, 0, false), 4000, 30, &lay)) && lay) {
-                        DWRITE_TEXT_METRICS tm{}; lay->GetMetrics(&tm); tw = tm.widthIncludingTrailingWhitespace;
-                    }
-                    FillRR(Rect{er.x + 8 + std::min(tw, er.width - 18), er.y + 6, 1.5f, er.height - 12}, 0.5f, vl);
-                }
+                DrawEditCaret(er.x + 8, er.y + 6, er.height - 12, 13.5f, er.x + er.width - 10, vl);
             } else Txt(e.name, Rect{r.x + 56, r.y, nameW - 56, r.height}, 13.5f, sel ? 600 : 400, sel ? kWhite : text);
-            Txt(FormatDate(e.mtime), Rect{x0 + 16 + nameW, r.y, colDate - 8, r.height}, 12.5f, 400, muted);
-            if (colType > 0) Txt(m_deep ? e.parent : TypeName(e), Rect{x0 + 16 + nameW + colDate, r.y, colType - 8, r.height}, 12.5f, 400, muted);
+            const bool netRoot = !m_home && !m_deep && IsNetRoot(m_path), netServer = !m_home && !m_deep && IsUncServer(m_path);
+            if (!netRoot && !netServer) Txt(FormatDate(e.mtime), Rect{x0 + 16 + nameW, r.y, colDate - 8, r.height}, 12.5f, 400, muted);
+            if (colType > 0) Txt(netRoot ? L"Bilgisayar" : (netServer ? L"Paylaşılan klasör" : (m_deep ? e.parent : TypeName(e))), Rect{x0 + 16 + nameW + colDate, r.y, colType - 8, r.height}, 12.5f, 400, muted);
             if (!e.dir) Txt(FormatSize(e.size), Rect{x0 + pw - colSize - 12, r.y, colSize, r.height}, 12.5f, 400, muted, 2);
         }
         if (cutRow) m_ctx->PopLayer();
@@ -3643,6 +3779,7 @@ void Explorer::DrawFolder(float W, float H) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
+    aether::core::InstallCrashHandler(L"AetherExplorer");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     SetCurrentProcessExplicitAppUserModelID(L"Aether.Explorer");     // own taskbar identity + icon
     OleInitialize(nullptr);

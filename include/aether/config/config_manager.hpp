@@ -48,6 +48,8 @@ struct DynamicIslandConfig {
     float expandedVolumeWidth{260.0f};
     float expandedVolumeHeight{44.0f};
     float topOffset{14.0f};
+    float posY{0.0f};                // vertical position of the island: 0 = at the top (topOffset applies), 100 = as low as the expanded pill still fits on screen (percent)
+    float posX{50.0f};               // horizontal position of the island: 0 = left edge, 50 = centred, 100 = right edge (percent of the screen width)
     bool expandOnHover{true};
     float hoverDelayMs{120.0f};
     bool pinOnClick{true};
@@ -64,6 +66,7 @@ struct DesktopWidgetConfig {
     core::Vec2 size{220.0f, 110.0f};
     float opacity{0.92f};
     bool locked{false};
+    float scale{1.0f};   // user size of the card (0.6 .. 2.0), set by dragging the corner grip or in the settings
 };
 
 struct WidgetsConfig {

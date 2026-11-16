@@ -61,7 +61,7 @@ Draggable, grid-snapping cards: System performance, Network activity, Clock, Sto
 Aether can replace `explorer.exe` for a user (or for everybody). `AetherShell` starts and restarts the bar, desktop and island, runs the logon startup items (Run, RunOnce, Startup folders) and provides Alt+Tab, Win+Tab, Win+R, Win+M, Win+I, Win+D, Win+E. Escape hatches: hold **Shift** while signing in, or create `%APPDATA%\Aether\use-explorer`. Details: [tools/KABUK.md](tools/KABUK.md) (Turkish).
 
 ### Intro and installer
-- `AetherIntro` is a short logo animation (aurora, particles, glowing logo, progress line) at logon; `--first` gives the longer welcome version. Click / Esc skips it. Create `%APPDATA%\Aether\no-intro` to disable it.
+- `AetherIntro` is a short, calm logo animation (logo, wordmark, hairline progress bar) at logon; `--first` gives the longer welcome version. Click / Esc skips it. Create `%APPDATA%\Aether\no-intro` to disable it.
 - `AetherSetup` is a modern single-file installer (English / Turkish, follows Windows): install folder, components, shortcuts, start with Windows, open folders in Aether Explorer, startup animation, **replace the Windows shell** (this user or all users). The programs are embedded; `Uninstall.exe` is placed in the install folder, registered in *Apps* and restores everything it changed. `AetherSetup.exe /S` installs silently with the defaults.
 
 ### Themes and settings

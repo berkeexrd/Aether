@@ -39,8 +39,10 @@
 #include "aether/render/dcomp_layer.hpp"
 #include "aether/render/glass.hpp"
 #include "aether/system/wallpaper.hpp"
+#include "aether/system/bar_pin_msg.hpp"
 #include "model.hpp"
 #include "shellutil.hpp"
+#include "aether/core/crash.hpp"
 
 using namespace aether;
 using core::Color;
@@ -72,7 +74,7 @@ struct Metrics { float icon, cw, ch; };
 const Color kAccents[6] = {{0.55f, 0.30f, 0.95f, 1.0f}, {0.30f, 0.55f, 1.0f, 1.0f}, {0.95f, 0.35f, 0.70f, 1.0f}, {0.20f, 0.78f, 0.52f, 1.0f}, {1.0f, 0.60f, 0.20f, 1.0f}, {0.20f, 0.80f, 0.90f, 1.0f}};
 const int kFitCodes[6] = {-1, 10, 6, 2, 0, 100};
 
-enum Kind { K_File = 0, K_Folder, K_PC, K_Bin, K_User, K_Net };
+enum Kind { K_File = 0, K_Folder, K_PC, K_Bin, K_User, K_Net, K_Aether };
 
 struct Item {
     std::wstring key, path, label, ext;
@@ -82,7 +84,7 @@ struct Item {
     uint64_t size{0};
     int col{-1}, row{-1};
     std::wstring disp; float layW{-1}; ComPtr<IDWriteTextLayout> lay; float lx{0}, lw{0}, lh{0};   // label fitted to two lines (cached layout)
-    bool Special() const { return kind == K_PC || kind == K_Bin || kind == K_Net; }
+    bool Special() const { return kind == K_PC || kind == K_Bin || kind == K_Net || kind == K_Aether; }
 };
 
 // A wallpaper baked once at screen size (so a frame is a single 1:1 bitmap blit, never a per-frame rescale).
@@ -164,7 +166,7 @@ public:
     void Push(HWND h, std::wstring key, std::wstring path, int px, bool thumb) {
         std::lock_guard<std::mutex> lk(m_mu);
         m_q.push_back({h, std::move(key), std::move(path), px, thumb});
-        while (m_started < 2) { ++m_started; std::thread([this] { Run(); }).detach(); }
+        while (m_started < 2) { ++m_started; ::aether::core::SafeThread("bg", [this] { Run(); }).detach(); }
         m_cv.notify_one();
     }
     void Clear(HWND h) { std::lock_guard<std::mutex> lk(m_mu); for (auto it = m_q.begin(); it != m_q.end();) { if (it->hwnd == h) it = m_q.erase(it); else ++it; } }
@@ -303,7 +305,7 @@ private:
     int m_labelStyle{0}; int m_accent{0}; float m_glow{1.0f}; bool m_clock{false};
     bool m_slide{false}; int m_slideMin{5}; std::wstring m_slideDir; int m_slideIdx{0};
     std::vector<std::wstring> m_slides;
-    bool m_auto{false}, m_showIcons{true}, m_showPC{true}, m_showBin{true}, m_showUser{false}, m_showNet{false};
+    bool m_auto{false}, m_showIcons{true}, m_showPC{true}, m_showBin{true}, m_showUser{false}, m_showNet{false}, m_showAether{true};
     int m_sortKey{0};                          // 0 name 1 size 2 type 3 date (used by auto arrange)
     std::map<std::wstring, Pos3> m_pos;
     std::map<std::wstring, std::pair<Pos3, ULONGLONG>> m_pendingDrop;   // external drops waiting for the copied file to appear
@@ -422,6 +424,7 @@ private:
     void LoadSlides();
     void ApplySlideTimer();
     void PickSlideFolder();
+    void OpenAetherSettings();
     void EnsureLabel(Item& it, float w);
     void DrawClock();
     void DrawPanel();
@@ -438,6 +441,32 @@ private:
     void ResetLook();
     void ToggleShowDesktop();
     friend class DesktopDropTarget;
+};
+
+// Like the shell's drop source, and it also lets the bar know when the icons are carried over it (the bar cannot be a real OLE target: it runs elevated).
+class BarAwareDropSource : public IDropSource {
+    LONG m_ref{1};
+public:
+    HWND dropBar{nullptr}; POINT dropPt{0, 0};
+    HRESULT __stdcall QueryInterface(REFIID r, void** o) override {
+        if (r == IID_IUnknown || r == IID_IDropSource) { *o = static_cast<IDropSource*>(this); AddRef(); return S_OK; }
+        *o = nullptr; return E_NOINTERFACE;
+    }
+    ULONG __stdcall AddRef() override { return InterlockedIncrement(&m_ref); }
+    ULONG __stdcall Release() override { const LONG r = InterlockedDecrement(&m_ref); if (!r) delete this; return r; }
+    HRESULT __stdcall QueryContinueDrag(BOOL esc, DWORD keys) override {
+        POINT pt{}; GetCursorPos(&pt);
+        HWND bar = aether::system::barpin::BarAt(pt);
+        if (esc) return DRAGDROP_S_CANCEL;
+        if (!(keys & MK_LBUTTON)) { dropBar = bar; dropPt = pt; return DRAGDROP_S_DROP; }
+        if (bar) aether::system::barpin::PostHover(bar, pt);
+        return S_OK;
+    }
+    HRESULT __stdcall GiveFeedback(DWORD) override {
+        POINT pt{}; GetCursorPos(&pt);
+        if (aether::system::barpin::BarAt(pt)) { SetCursor(LoadCursorW(nullptr, IDC_ARROW)); return S_OK; }   // not the "forbidden" cursor: dropping here pins
+        return DRAGDROP_S_USEDEFAULTCURSORS;
+    }
 };
 
 class DesktopDropTarget : public IDropTarget {
@@ -771,7 +800,12 @@ LRESULT Desktop::Handle(UINT m, WPARAM w, LPARAM l) {
             if (GetFileAttributesExW(CfgPath().c_str(), GetFileExInfoStandard, &fa) &&
                 (fa.ftLastWriteTime.dwLowDateTime != m_cfgWrite.dwLowDateTime || fa.ftLastWriteTime.dwHighDateTime != m_cfgWrite.dwHighDateTime)) {
                 m_cfgWrite = fa.ftLastWriteTime;
-                LoadCfg(); LoadItems(); LoadWallpaper(false); CheckBin(); Kick();
+                const std::wstring oldDir = m_slideDir; const bool oldSlide = m_slide; const int oldMin = m_slideMin; const bool oldAuto = m_auto; const float oldIcon = m_iconSize;
+                LoadCfg(); LoadItems();
+                if (m_slideDir != oldDir) { m_slideIdx = 0; LoadSlides(); }
+                if (m_slide != oldSlide || m_slideMin != oldMin || m_slideDir != oldDir) { if (m_slide && m_slides.empty()) LoadSlides(); ApplySlideTimer(); LoadWallpaper(true); }
+                if (m_auto != oldAuto || m_iconSize != oldIcon) Place();
+                LoadWallpaper(false); CheckBin(); Kick();
             }
             const ULONGLONG tn = GetTickCount64();
             for (auto it = m_pendingDrop.begin(); it != m_pendingDrop.end();) if (tn - it->second.second > 15000) it = m_pendingDrop.erase(it); else ++it;
@@ -785,7 +819,7 @@ LRESULT Desktop::Handle(UINT m, WPARAM w, LPARAM l) {
             else { HWND a = DesktopAnchor(); if (a && GetWindow(a, GW_HWNDPREV) != m_hwnd) AnchorZ(); }   // Explorer raised its own desktop: climb back above it
         } else if (w == kTimerSave) { KillTimer(m_hwnd, kTimerSave); SaveCfg(); }
         else if (w == kTimerReload) { KillTimer(m_hwnd, kTimerReload); LoadItems(); CheckBin(); }
-        else if (w == kTimerSlide) { if (!m_slides.empty()) { m_slideIdx = (m_slideIdx + 1) % static_cast<int>(m_slides.size()); LoadWallpaper(true); } }
+        else if (w == kTimerSlide) { if (!m_slides.empty()) { m_slideIdx = (m_slideIdx + 1) % static_cast<int>(m_slides.size()); LoadWallpaper(true); system::wallpaper::we::Apply(m_slides[static_cast<size_t>(m_slideIdx)]); } }
         else if (w == kTimerCaret) Kick();
         return 0;
     case WM_INITMENUPOPUP: case WM_DRAWITEM: case WM_MEASUREITEM: case WM_MENUCHAR:
@@ -914,6 +948,7 @@ void Desktop::LoadCfg() {
         else if (k == L"bin") m_showBin = iv != 0;
         else if (k == L"user") m_showUser = iv != 0;
         else if (k == L"net") m_showNet = iv != 0;
+        else if (k == L"aether") m_showAether = iv != 0;
         else if (k == L"sort") m_sortKey = std::clamp(iv, 0, 3);
         else if (k == L"dim") m_dim = std::clamp(iv / 100.0f, 0.0f, 0.7f);
         else if (k == L"blur") m_blur = std::clamp(iv, 0, 3);
@@ -970,6 +1005,7 @@ void Desktop::SaveCfg() {
     put(L"bin", I(m_showBin));
     put(L"user", I(m_showUser));
     put(L"net", I(m_showNet));
+    put(L"aether", I(m_showAether));
     put(L"sort", I(m_sortKey));
     put(L"dim", I(static_cast<int>(std::lround(m_dim * 100))));
     put(L"blur", I(m_blur));
@@ -1191,6 +1227,7 @@ void Desktop::LoadItems() {
     }
     if (m_showNet) special(L"::net", L"::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", L"Ağ", K_Net);
     if (m_showBin) special(L"::bin", L"::{645FF040-5081-101B-9F08-00AA002F954E}", L"Geri Dönüşüm Kutusu", K_Bin);
+    if (m_showAether) { Item it; it.key = L"::aether"; it.label = L"Aether"; it.kind = K_Aether; it.dir = false; v.push_back(std::move(it)); }   // opens the Settings Center; not a drop target
 
     std::vector<Item> files;
     for (const std::wstring& dir : {m_desktopDir, m_publicDir}) {
@@ -1312,7 +1349,7 @@ void Desktop::StartWatch() {
     if (!stop) return;
     m_watchStop = stop;
     const HWND hwnd = m_hwnd; const std::wstring a = m_desktopDir, b = m_publicDir;
-    std::thread([=]() {
+    ::aether::core::SafeThread("bg", [=]() {
         HANDLE h[3]; int n = 0;
         h[n++] = stop;
         HANDLE ha = a.empty() ? INVALID_HANDLE_VALUE : FindFirstChangeNotificationW(a.c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE);
@@ -1482,6 +1519,16 @@ void Desktop::DrawIcon(const Item& it, const Rect& r, float alpha) {
         FillRR(Rect{r.x, r.y, w, h}, h * 0.3f, WithA(Acc(), 0.14f * alpha));
         Glyph(0xE774, r, h * 0.92f, WithA(accL, alpha));
         return;
+    case K_Aether: {                                                     // accent tile with a gear: the way into the Settings Center
+        const Rect tile{r.x + w * 0.04f, r.y + h * 0.04f, w * 0.92f, h * 0.92f};
+        GlowRR(tile, h * 0.26f, accL, 7.0f, 0.55f * alpha * m_glow);
+        FillRR(tile, h * 0.26f, WithA(Acc(), 0.94f * alpha));
+        if (auto g = m_dcomp->CreateLinearGradientBrush(WithA(kWhite, 0.30f * alpha), WithA(kWhite, 0.0f), D2D1::Point2F(0, tile.y), D2D1::Point2F(0, tile.y + tile.height * 0.7f)))
+            m_ctx->FillRoundedRectangle(D2D1::RoundedRect(D(tile), h * 0.26f, h * 0.26f), g.Get());
+        StrokeRR(tile, h * 0.26f, WithA(kWhite, 0.35f * alpha), 1.0f);
+        Glyph(0xE713, tile, h * 0.52f, Color{1.0f, 1.0f, 1.0f, 0.97f * alpha});
+        return;
+    }
     case K_Bin: {
         FillRR(Rect{r.x, r.y + h * 0.04f, w, h * 0.92f}, h * 0.14f, WithA(Acc(), 0.14f * alpha));
         if (m_binFull) {
@@ -2076,6 +2123,13 @@ void Desktop::OpenFolder(const std::wstring& path) {
     } else ShellExecuteW(m_hwnd, L"open", path.empty() ? L"shell:MyComputerFolder" : path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+// The Settings Center lives in Aether.exe: a running copy is asked to show its Desktop page, otherwise a new one starts on it.
+void Desktop::OpenAetherSettings() {
+    const std::wstring exe = ExeDir() + L"\\Aether.exe";
+    if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    ShellExecuteW(m_hwnd, L"open", exe.c_str(), L"--settings desktop", ExeDir().c_str(), SW_SHOWNORMAL);
+}
+
 void Desktop::OpenItem(int i) {
     if (i < 0 || i >= Count()) return;
     const Item& it = m_items[i];
@@ -2088,6 +2142,7 @@ void Desktop::OpenItem(int i) {
             return;
         }
         case K_Net: OpenFolder(L"net:"); return;
+        case K_Aether: OpenAetherSettings(); return;
         case K_Folder: case K_User: OpenFolder(it.path); return;
         default: break;
     }
@@ -2202,6 +2257,12 @@ void Desktop::ItemMenu(int i, POINT pt) {
     using aether::ui::MenuItem; using aether::ui::MenuSeparator;
     const Item& it = m_items[i];
     const bool multi = SelectedIdx().size() > 1;
+    if (it.kind == K_Aether) {
+        const int c = aether::ui::ShowContextMenu({MenuItem(1, L"Ayar Merkezi'ni aç", 0xE713), MenuSeparator(), MenuItem(2, L"Bu simgeyi masaüstünden gizle", 0xE711)}, pt);
+        if (c == 1) OpenAetherSettings();
+        else if (c == 2) { m_showAether = false; LoadItems(); SaveCfg(); Kick(); }
+        return;
+    }
     std::vector<aether::ui::MenuEntry> items;
     items.push_back(MenuItem(1, L"Aç", bui::kGlyphEnter, false, L"Enter"));
     if (!multi && (it.kind == K_Folder || it.kind == K_User)) items.push_back(MenuItem(2, L"Aether Explorer'da aç", 0xE838));
@@ -2240,7 +2301,8 @@ void Desktop::ViewMenu(POINT pt) {
                                                MenuItem(4, L"Otomatik düzenle", 0xE8FD, false, m_auto ? L"●" : L""),
                                                MenuItem(5, L"Masaüstü simgelerini göster", 0xE7B3, false, m_showIcons ? L"●" : L""), MenuSeparator(),
                                                MenuItem(6, L"Bu Bilgisayar", 0xE7F8, false, m_showPC ? L"●" : L""), MenuItem(7, L"Geri Dönüşüm Kutusu", 0xE74D, false, m_showBin ? L"●" : L""),
-                                               MenuItem(8, L"Kullanıcı klasörü", 0xE77B, false, m_showUser ? L"●" : L""), MenuItem(9, L"Ağ", 0xE774, false, m_showNet ? L"●" : L"")}, pt);
+                                               MenuItem(8, L"Kullanıcı klasörü", 0xE77B, false, m_showUser ? L"●" : L""), MenuItem(9, L"Ağ", 0xE774, false, m_showNet ? L"●" : L""),
+                                               MenuItem(10, L"Aether simgesi", 0xE713, false, m_showAether ? L"●" : L"")}, pt);
     if (c >= 1 && c <= 3) { static const float sizes[3] = {36.0f, 48.0f, 72.0f}; m_iconSize = sizes[c - 1]; Place(); }
     else if (c == 4) { m_auto = !m_auto; Place(); }
     else if (c == 5) m_showIcons = !m_showIcons;
@@ -2248,6 +2310,7 @@ void Desktop::ViewMenu(POINT pt) {
     else if (c == 7) { m_showBin = !m_showBin; LoadItems(); }
     else if (c == 8) { m_showUser = !m_showUser; LoadItems(); }
     else if (c == 9) { m_showNet = !m_showNet; LoadItems(); }
+    else if (c == 10) { m_showAether = !m_showAether; LoadItems(); }
     if (c) { SaveCfg(); Kick(); }
 }
 void Desktop::SortMenu(POINT pt) {
@@ -2283,7 +2346,7 @@ void Desktop::BackgroundMenu(POINT pt) {
     std::vector<aether::ui::MenuEntry> items = {
         MenuItem(1, L"Görünüm", bui::kGlyphView), MenuItem(2, L"Sırala", bui::kGlyphSort), MenuItem(3, L"Yenile", bui::kGlyphRefresh, false, L"F5"), MenuSeparator(),
         MenuItem(4, L"Yapıştır", bui::kGlyphPaste, false, L"Ctrl+V"), MenuItem(5, L"Yeni", bui::kGlyphNewFolder), MenuSeparator(),
-        MenuItem(11, L"Özelleştir (Aether)", 0xE790), MenuItem(6, L"Duvar kağıdını değiştir...", 0xE91B), MenuItem(7, L"Ekran ayarları", 0xE7F4), MenuItem(8, L"Windows kişiselleştirme", 0xE771), MenuSeparator(),
+        MenuItem(11, L"Masaüstünü özelleştir (Aether)", 0xE790), MenuItem(6, L"Duvar kağıdını değiştir...", 0xE91B), MenuItem(7, L"Ekran ayarları", 0xE7F4), MenuItem(8, L"Windows kişiselleştirme", 0xE771), MenuSeparator(),
         MenuItem(9, L"Aether Explorer'da aç", 0xE838), MenuItem(10, L"Terminalde aç", 0xE756)};
     items[4].enabled = IsClipboardFormatAvailable(CF_HDROP) != 0;
     const int c = aether::ui::ShowContextMenu(items, pt);
@@ -2294,7 +2357,7 @@ void Desktop::BackgroundMenu(POINT pt) {
         case 4: Paste(); break;
         case 5: NewMenu(pt); break;
         case 6: m_slide = false; ApplySlideTimer(); PickWallpaper(); break;
-        case 11: m_panel = true; m_panelScroll = 0; Kick(); break;
+        case 11: OpenAetherSettings(); break;
         case 7: ShellExecuteW(m_hwnd, L"open", L"ms-settings:display", nullptr, nullptr, SW_SHOWNORMAL); break;
         case 8: ShellExecuteW(m_hwnd, L"open", L"ms-settings:personalization", nullptr, nullptr, SW_SHOWNORMAL); break;
         case 9: OpenFolder(m_desktopDir); break;
@@ -2340,12 +2403,15 @@ void Desktop::StartOleDrag() {
     if (paths.empty()) return;
     auto data = su::MakeDataObject(paths);
     if (!data) return;
+    auto* bds = new BarAwareDropSource();
     ComPtr<IDropSource> src;
-    src.Attach(new su::ShellDropSource());
+    src.Attach(bds);
     m_oleDrag = true;
     DWORD eff = 0;
     DoDragDrop(data.Get(), src.Get(), DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &eff);
     m_oleDrag = false;
+    if (bds->dropBar && eff == DROPEFFECT_NONE)          // released over the bar: pin the dropped items there
+        aether::system::barpin::SendDrop(bds->dropBar, bds->dropPt, paths);
     m_pressItem = -1;
     if (eff & DROPEFFECT_MOVE) SetTimer(m_hwnd, kTimerReload, 400, nullptr);
     Kick();
@@ -2610,6 +2676,7 @@ void Desktop::OnChar(wchar_t c) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+    aether::core::InstallCrashHandler(L"AetherDesktop");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     HANDLE once = CreateMutexW(nullptr, TRUE, L"Aether.Desktop.SingleInstance");
     if (once && GetLastError() == ERROR_ALREADY_EXISTS) return 0;

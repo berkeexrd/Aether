@@ -1,4 +1,7 @@
 #include "aether/bar/start_menu.hpp"
+#include "aether/bar/bar_edge.hpp"
+#include "aether/bar/aether_bar.hpp"
+#include "aether/system/app_identity.hpp"
 #include "aether/render/context_menu.hpp"
 #include "aether/bar/ui_common.hpp"
 #include "aether/core/i18n.hpp"
@@ -21,6 +24,8 @@
 #include <cwctype>
 #include <cstdlib>
 #include <unordered_set>
+#include "aether/core/crash.hpp"
+#include "aether/system/icon_pack.hpp"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -281,36 +286,173 @@ std::wstring Ago(const FILETIME& ft) {
     return b;
 }
 
-struct SettingDef { const wchar_t* en; const wchar_t* tr; const wchar_t* uri; };
+// Windows settings pages (ms-settings: URIs) and classic tools, searchable like Windows' own Start search. `kw` holds extra search words
+// (English and Turkish); matching folds case and Turkish letters. `tool` entries are classic consoles / control panel applets.
+struct SettingDef { const wchar_t* en; const wchar_t* tr; const wchar_t* uri; const wchar_t* kw; bool tool; };
 const SettingDef kSettings[] = {
-    {L"Wi-Fi", L"Wi-Fi", L"ms-settings:network-wifi"},
-    {L"Network & internet", L"Ağ ve internet", L"ms-settings:network"},
-    {L"Bluetooth & devices", L"Bluetooth ve cihazlar", L"ms-settings:bluetooth"},
-    {L"Display", L"Ekran", L"ms-settings:display"},
-    {L"Sound", L"Ses", L"ms-settings:sound"},
-    {L"Notifications", L"Bildirimler", L"ms-settings:notifications"},
-    {L"Power & battery", L"Güç ve pil", L"ms-settings:powersleep"},
-    {L"Storage", L"Depolama", L"ms-settings:storagesense"},
-    {L"Personalization", L"Kişiselleştirme", L"ms-settings:personalization"},
-    {L"Background", L"Arka plan", L"ms-settings:personalization-background"},
-    {L"Colors", L"Renkler", L"ms-settings:colors"},
-    {L"Apps & features", L"Uygulamalar ve özellikler", L"ms-settings:appsfeatures"},
-    {L"Default apps", L"Varsayılan uygulamalar", L"ms-settings:defaultapps"},
-    {L"Startup apps", L"Başlangıç uygulamaları", L"ms-settings:startupapps"},
-    {L"Accounts", L"Hesaplar", L"ms-settings:yourinfo"},
-    {L"Date & time", L"Tarih ve saat", L"ms-settings:dateandtime"},
-    {L"Language & region", L"Dil ve bölge", L"ms-settings:regionlanguage"},
-    {L"Gaming", L"Oyun", L"ms-settings:gaming-gamebar"},
-    {L"Privacy & security", L"Gizlilik ve güvenlik", L"ms-settings:privacy"},
-    {L"Windows Update", L"Windows Update", L"ms-settings:windowsupdate"},
-    {L"Night light", L"Gece ışığı", L"ms-settings:nightlight"},
-    {L"Mouse", L"Fare", L"ms-settings:mousetouchpad"},
-    {L"Keyboard", L"Klavye", L"ms-settings:easeofaccess-keyboard"},
-    {L"Printers & scanners", L"Yazıcılar ve tarayıcılar", L"ms-settings:printers"},
-    {L"VPN", L"VPN", L"ms-settings:network-vpn"},
-    {L"Accessibility", L"Erişilebilirlik", L"ms-settings:easeofaccess"},
-    {L"About", L"Hakkında", L"ms-settings:about"},
+    // network
+    {L"Wi-Fi", L"Wi-Fi", L"ms-settings:network-wifi", L"wireless wifi internet kablosuz ag baglanti", false},
+    {L"Network & internet", L"Ağ ve internet", L"ms-settings:network", L"network internet status ag durum baglanti", false},
+    {L"Ethernet", L"Ethernet", L"ms-settings:network-ethernet", L"cable lan kablolu ag", false},
+    {L"VPN", L"VPN", L"ms-settings:network-vpn", L"virtual private network sanal ozel ag", false},
+    {L"Proxy", L"Ara sunucu (Proxy)", L"ms-settings:network-proxy", L"proxy vekil sunucu", false},
+    {L"Airplane mode", L"Uçak modu", L"ms-settings:network-airplanemode", L"flight radio ucak ucus", false},
+    {L"Mobile hotspot", L"Mobil etkin nokta", L"ms-settings:network-mobilehotspot", L"hotspot tethering paylasim", false},
+    {L"Data usage", L"Veri kullanımı", L"ms-settings:datausage", L"data metered bandwidth kota", false},
+    {L"Advanced network settings", L"Gelişmiş ağ ayarları", L"ms-settings:network-advancedsettings", L"adapter dns ip", false},
+    // devices
+    {L"Bluetooth & devices", L"Bluetooth ve cihazlar", L"ms-settings:bluetooth", L"bluetooth pair eslestir cihaz", false},
+    {L"Printers & scanners", L"Yazıcılar ve tarayıcılar", L"ms-settings:printers", L"printer scanner yazici tarayici", false},
+    {L"Mouse", L"Fare", L"ms-settings:mousetouchpad", L"mouse pointer cursor imlec touchpad dokunmatik", false},
+    {L"Touchpad", L"Dokunmatik yüzey", L"ms-settings:devices-touchpad", L"touchpad dokunmatik fare", false},
+    {L"Typing", L"Yazma", L"ms-settings:typing", L"autocorrect spell klavye yazim denetimi", false},
+    {L"Pen & Windows Ink", L"Kalem ve Windows Ink", L"ms-settings:pen", L"pen stylus kalem", false},
+    {L"AutoPlay", L"Otomatik Kullan", L"ms-settings:autoplay", L"usb removable otomatik oynat", false},
+    {L"USB", L"USB", L"ms-settings:usb", L"usb port aygit", false},
+    {L"Cameras", L"Kameralar", L"ms-settings:camera", L"webcam camera kamera", false},
+    // system
+    {L"Display", L"Ekran", L"ms-settings:display", L"screen monitor resolution scale brightness cozunurluk parlaklik olcek monitor", false},
+    {L"Advanced display", L"Gelişmiş ekran", L"ms-settings:display-advanced", L"refresh rate hz yenileme hizi", false},
+    {L"Graphics", L"Grafik", L"ms-settings:display-advancedgraphics", L"gpu graphics ekran karti performans", false},
+    {L"Night light", L"Gece ışığı", L"ms-settings:nightlight", L"blue light mavi isik warm", false},
+    {L"Sound", L"Ses", L"ms-settings:sound", L"audio volume speaker microphone hoparlor mikrofon ses seviyesi", false},
+    {L"Notifications", L"Bildirimler", L"ms-settings:notifications", L"focus assist do not disturb odak rahatsiz etme", false},
+    {L"Focus", L"Odak", L"ms-settings:quietmomentshome", L"focus session concentrate odaklan", false},
+    {L"Power & battery", L"Güç ve pil", L"ms-settings:powersleep", L"battery sleep screen timeout power mode pil uyku guc", false},
+    {L"Battery saver", L"Pil tasarrufu", L"ms-settings:batterysaver", L"battery saver tasarruf", false},
+    {L"Storage", L"Depolama", L"ms-settings:storagesense", L"disk space cleanup temporary files depolama alan temizle", false},
+    {L"Multitasking", L"Çoklu görev", L"ms-settings:multitasking", L"snap windows desktops pencere sanal masaustu", false},
+    {L"Clipboard", L"Pano", L"ms-settings:clipboard", L"copy paste pano gecmis", false},
+    {L"Remote Desktop", L"Uzak Masaüstü", L"ms-settings:remotedesktop", L"rdp remote uzak baglanti", false},
+    {L"Projecting to this PC", L"Bu bilgisayara yansıtma", L"ms-settings:project", L"cast miracast yansit", false},
+    {L"Troubleshoot", L"Sorun gider", L"ms-settings:troubleshoot", L"fix repair sorun giderici onar", false},
+    {L"Recovery", L"Kurtarma", L"ms-settings:recovery", L"reset pc factory sifirla geri yukle", false},
+    {L"Activation", L"Etkinleştirme", L"ms-settings:activation", L"license key lisans anahtar", false},
+    {L"About", L"Hakkında", L"ms-settings:about", L"pc name device specs version bilgisayar adi surum ozellikler", false},
+    // personalisation
+    {L"Personalization", L"Kişiselleştirme", L"ms-settings:personalization", L"theme tema", false},
+    {L"Background", L"Arka plan", L"ms-settings:personalization-background", L"wallpaper desktop picture duvar kagidi masaustu resim", false},
+    {L"Colors", L"Renkler", L"ms-settings:colors", L"dark mode light accent karanlik mod koyu acik vurgu renk", false},
+    {L"Themes", L"Temalar", L"ms-settings:themes", L"theme cursor sound tema", false},
+    {L"Lock screen", L"Kilit ekranı", L"ms-settings:lockscreen", L"lock kilit", false},
+    {L"Start", L"Başlat", L"ms-settings:personalization-start", L"start menu baslat menu", false},
+    {L"Taskbar", L"Görev çubuğu", L"ms-settings:taskbar", L"taskbar icons tray gorev cubugu simge", false},
+    {L"Fonts", L"Yazı tipleri", L"ms-settings:fonts", L"font typeface yazi tipi", false},
+    {L"Text input", L"Metin girişi", L"ms-settings:personalization-textinput", L"emoji touch keyboard dokunmatik klavye", false},
+    // apps
+    {L"Apps & features", L"Uygulamalar ve özellikler", L"ms-settings:appsfeatures", L"uninstall remove programs kaldir uygulama program", false},
+    {L"Installed apps", L"Yüklü uygulamalar", L"ms-settings:appsfeatures", L"uninstall list yuklu program kaldir", false},
+    {L"Default apps", L"Varsayılan uygulamalar", L"ms-settings:defaultapps", L"browser default open with varsayilan tarayici ac", false},
+    {L"Optional features", L"İsteğe bağlı özellikler", L"ms-settings:optionalfeatures", L"features windows ozellik", false},
+    {L"Startup apps", L"Başlangıç uygulamaları", L"ms-settings:startupapps", L"autostart boot baslangic otomatik", false},
+    {L"Offline maps", L"Çevrimdışı haritalar", L"ms-settings:maps", L"maps harita", false},
+    {L"Apps for websites", L"Web siteleri için uygulamalar", L"ms-settings:appsforwebsites", L"web apps", false},
+    // accounts
+    {L"Accounts", L"Hesaplar", L"ms-settings:yourinfo", L"your info profile hesap bilgilerim profil", false},
+    {L"Email & accounts", L"E-posta ve hesaplar", L"ms-settings:emailandaccounts", L"mail eposta hesap", false},
+    {L"Sign-in options", L"Oturum açma seçenekleri", L"ms-settings:signinoptions", L"password pin hello fingerprint sifre parmak izi giris", false},
+    {L"Access work or school", L"İş veya okul erişimi", L"ms-settings:workplace", L"work school is okul hesap", false},
+    {L"Family & other users", L"Aile ve diğer kullanıcılar", L"ms-settings:otherusers", L"users family kullanici aile", false},
+    {L"Windows backup", L"Windows yedekleme", L"ms-settings:backup", L"backup sync yedek", false},
+    // time & language
+    {L"Date & time", L"Tarih ve saat", L"ms-settings:dateandtime", L"clock time zone saat saat dilimi", false},
+    {L"Language & region", L"Dil ve bölge", L"ms-settings:regionlanguage", L"language keyboard layout region dil bolge klavye", false},
+    {L"Speech", L"Konuşma", L"ms-settings:speech", L"voice microphone ses tanima konusma", false},
+    // gaming
+    {L"Gaming", L"Oyun", L"ms-settings:gaming-gamebar", L"game bar xbox oyun cubugu", false},
+    {L"Game Mode", L"Oyun Modu", L"ms-settings:gaming-gamemode", L"game mode performance oyun modu", false},
+    {L"Captures", L"Yakalamalar", L"ms-settings:gaming-captures", L"record screenshot kayit ekran goruntusu", false},
+    // accessibility
+    {L"Accessibility", L"Erişilebilirlik", L"ms-settings:easeofaccess", L"ease of access kolay erisim", false},
+    {L"Text size", L"Metin boyutu", L"ms-settings:easeofaccess-display", L"larger text font size yazi boyutu buyut", false},
+    {L"Mouse pointer & touch", L"Fare işaretçisi ve dokunma", L"ms-settings:easeofaccess-mousepointer", L"pointer size color isaretci boyut", false},
+    {L"Magnifier", L"Büyüteç", L"ms-settings:easeofaccess-magnifier", L"zoom magnify yakinlastir", false},
+    {L"Narrator", L"Ekran okuyucu", L"ms-settings:easeofaccess-narrator", L"screen reader anlatici", false},
+    {L"Contrast themes", L"Karşıtlık temaları", L"ms-settings:easeofaccess-highcontrast", L"high contrast yuksek karsitlik", false},
+    {L"Color filters", L"Renk filtreleri", L"ms-settings:easeofaccess-colorfilter", L"colour blind grayscale renk koru gri", false},
+    {L"Closed captions", L"Altyazılar", L"ms-settings:easeofaccess-closedcaptioning", L"captions subtitles altyazi", false},
+    {L"Keyboard accessibility", L"Klavye erişilebilirliği", L"ms-settings:easeofaccess-keyboard", L"sticky keys on-screen keyboard yapiskan tuslar ekran klavyesi", false},
+    // privacy & security
+    {L"Privacy & security", L"Gizlilik ve güvenlik", L"ms-settings:privacy", L"permissions izin gizlilik guvenlik", false},
+    {L"Location", L"Konum", L"ms-settings:privacy-location", L"gps location privacy konum", false},
+    {L"Camera privacy", L"Kamera gizliliği", L"ms-settings:privacy-webcam", L"webcam permission kamera izin", false},
+    {L"Microphone privacy", L"Mikrofon gizliliği", L"ms-settings:privacy-microphone", L"mic permission mikrofon izin", false},
+    {L"Diagnostics & feedback", L"Tanılama ve geri bildirim", L"ms-settings:privacy-feedback", L"telemetry data tani", false},
+    {L"Activity history", L"Etkinlik geçmişi", L"ms-settings:privacy-activityhistory", L"timeline gecmis", false},
+    {L"Background apps", L"Arka plan uygulamaları", L"ms-settings:privacy-backgroundapps", L"background arka plan", false},
+    {L"Windows Security", L"Windows Güvenliği", L"ms-settings:windowsdefender", L"defender antivirus virus firewall koruma", false},
+    {L"Find my device", L"Cihazımı bul", L"ms-settings:findmydevice", L"locate lost cihaz bul", false},
+    {L"For developers", L"Geliştiriciler için", L"ms-settings:developers", L"developer mode gelistirici", false},
+    // update
+    {L"Windows Update", L"Windows Update", L"ms-settings:windowsupdate", L"updates check guncelleme denetle", false},
+    {L"Update history", L"Güncelleştirme geçmişi", L"ms-settings:windowsupdate-history", L"installed updates gecmis", false},
+    {L"Advanced update options", L"Gelişmiş güncelleştirme seçenekleri", L"ms-settings:windowsupdate-options", L"active hours etkin saatler", false},
+    {L"Delivery Optimization", L"Teslim İyileştirme", L"ms-settings:delivery-optimization", L"bandwidth", false},
+    {L"Windows Insider Program", L"Windows Insider Programı", L"ms-settings:windowsinsider", L"insider preview", false},
+    // classic tools
+    {L"Device Manager", L"Aygıt Yöneticisi", L"devmgmt.msc", L"drivers hardware surucu donanim", true},
+    {L"Disk Management", L"Disk Yönetimi", L"diskmgmt.msc", L"partition format volume disk bolum surucu", true},
+    {L"Services", L"Hizmetler", L"services.msc", L"service windows hizmet", true},
+    {L"Task Manager", L"Görev Yöneticisi", L"taskmgr.exe", L"processes performance islem gorev", true},
+    {L"Registry Editor", L"Kayıt Defteri Düzenleyicisi", L"regedit.exe", L"regedit registry kayit defteri", true},
+    {L"Control Panel", L"Denetim Masası", L"control.exe", L"control panel denetim", true},
+    {L"Event Viewer", L"Olay Görüntüleyicisi", L"eventvwr.msc", L"logs olay gunluk", true},
+    {L"Computer Management", L"Bilgisayar Yönetimi", L"compmgmt.msc", L"management yonetim", true},
+    {L"Task Scheduler", L"Görev Zamanlayıcı", L"taskschd.msc", L"schedule zamanlayici", true},
+    {L"System Information", L"Sistem Bilgileri", L"msinfo32.exe", L"msinfo hardware donanim bilgi", true},
+    {L"Resource Monitor", L"Kaynak İzleyicisi", L"resmon.exe", L"cpu memory disk network kaynak", true},
+    {L"Performance Monitor", L"Performans İzleyicisi", L"perfmon.exe", L"perf performans", true},
+    {L"Network Connections", L"Ağ Bağlantıları", L"ncpa.cpl", L"adapters ethernet wifi baglanti baglayici", true},
+    {L"Programs and Features", L"Programlar ve Özellikler", L"appwiz.cpl", L"uninstall program kaldir", true},
+    {L"System Properties", L"Sistem Özellikleri", L"sysdm.cpl", L"environment variables ortam degiskenleri gelismis", true},
+    {L"Power Options", L"Güç Seçenekleri", L"powercfg.cpl", L"power plan guc plani", true},
+    {L"Internet Options", L"İnternet Seçenekleri", L"inetcpl.cpl", L"ie internet", true},
+    {L"Sound (classic)", L"Ses (klasik)", L"mmsys.cpl", L"playback recording hoparlor kayit", true},
+    {L"Windows Firewall", L"Windows Güvenlik Duvarı", L"firewall.cpl", L"firewall guvenlik duvari", true},
+    {L"Advanced Firewall", L"Gelişmiş Güvenlik Duvarı", L"wf.msc", L"firewall rules kurallar", true},
+    {L"User Accounts (netplwiz)", L"Kullanıcı Hesapları (netplwiz)", L"netplwiz.exe", L"autologin users kullanici otomatik oturum", true},
+    {L"Disk Cleanup", L"Disk Temizleme", L"cleanmgr.exe", L"cleanup temizle", true},
+    {L"Defragment and Optimize Drives", L"Sürücüleri Birleştir ve En İyi Duruma Getir", L"dfrgui.exe", L"defrag optimize trim", true},
+    {L"Remote Desktop Connection", L"Uzak Masaüstü Bağlantısı", L"mstsc.exe", L"rdp remote uzak", true},
+    {L"Command Prompt", L"Komut İstemi", L"cmd.exe", L"cmd terminal console komut", true},
+    {L"Windows PowerShell", L"Windows PowerShell", L"powershell.exe", L"powershell terminal", true},
+    {L"Character Map", L"Karakter Eşlemi", L"charmap.exe", L"symbols special characters ozel karakter", true},
+    {L"On-Screen Keyboard", L"Ekran Klavyesi", L"osk.exe", L"keyboard klavye", true},
 };
+
+struct SettingFold { std::wstring en, tr, kw, all; };
+const std::vector<SettingFold>& SettingFolds() {
+    static const std::vector<SettingFold> folds = [] {
+        std::vector<SettingFold> v;
+        v.reserve(ARRAYSIZE(kSettings));
+        for (const auto& d : kSettings) {
+            SettingFold f{Fold(d.en), Fold(d.tr), d.kw ? Fold(d.kw) : std::wstring()};
+            f.all = f.en + L" " + f.tr + L" " + f.kw;
+            v.push_back(std::move(f));
+        }
+        return v;
+    }();
+    return folds;
+}
+
+// 0 best ... 9 no match. Name matches beat keyword matches; "dark mode" style queries match when every word is somewhere in the entry.
+int ScoreSetting(const SettingFold& f, const std::wstring& q, const std::vector<std::wstring>& words) {
+    auto at = [&](const std::wstring& hay) {
+        const size_t pos = hay.find(q);
+        if (pos == std::wstring::npos) return 9;
+        if (pos == 0) return 0;
+        const wchar_t p = hay[pos - 1];
+        return (p == L' ' || p == L'-' || p == L'(' || p == L'&') ? 1 : 2;
+    };
+    int best = std::min(at(f.en), at(f.tr));
+    if (best == 9 && at(f.kw) != 9) best = 3;
+    if (best == 9 && words.size() > 1) {
+        bool all = true;
+        for (const auto& w : words) if (f.all.find(w) == std::wstring::npos) { all = false; break; }
+        if (all) best = 4;
+    }
+    return best;
+}
 
 } // namespace
 
@@ -348,7 +490,7 @@ void StartMenu::PreloadAsync() {
     m_loadState = 1;
     m_fileState = 1;
 
-    m_loader = std::thread([this] {
+    m_loader = ::aether::core::SafeThread("bg", [this] {
         const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
         std::vector<std::pair<std::wstring, std::wstring>> raw;
         ComPtr<IShellItem> folder;
@@ -375,7 +517,7 @@ void StartMenu::PreloadAsync() {
     });
 
     // recently opened files: resolve the shortcuts in the Recent folder
-    m_recentLoader = std::thread([this] {
+    m_recentLoader = ::aether::core::SafeThread("bg", [this] {
         const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
         std::vector<FileItem> out;
         const std::wstring dir = KnownFolder(FOLDERID_Recent);
@@ -413,7 +555,7 @@ void StartMenu::PreloadAsync() {
     });
 
     // searchable index of the user's own folders (depth limited)
-    m_fileLoader = std::thread([this] {
+    m_fileLoader = ::aether::core::SafeThread("bg", [this] {
         std::vector<FileItem> out;
         const KNOWNFOLDERID* roots[] = {&FOLDERID_Desktop, &FOLDERID_Documents, &FOLDERID_Downloads, &FOLDERID_Pictures, &FOLDERID_Music, &FOLDERID_Videos};
         struct Walk {
@@ -545,6 +687,10 @@ void StartMenu::TogglePin(const std::wstring& parse) {
 void StartMenu::EnsureAppIcon(App& app) {
     if (app.icon || app.iconTried) return;
     app.iconTried = true;
+    if (system::iconpack::Active()) {                                   // the user's icon pack wins over the program's own icon
+        const std::wstring f = system::iconpack::Find(app.parse);
+        if (!f.empty()) { app.icon = system::iconpack::LoadBitmap(m_dcomp->GetContext(), f); if (app.icon) return; }
+    }
     ComPtr<IShellItem> item;
     const std::wstring path = L"shell:AppsFolder\\" + app.parse;
     if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item)))) return;
@@ -803,6 +949,10 @@ void StartMenu::Show(HMONITOR monitor, int reservedPx) {
     if (!m_hwnd) return;
     AdoptLoaded();
     if (m_loadState.load() == 0) PreloadAsync();
+    {   // a different icon pack was chosen: reload the app icons in the new style
+        const unsigned pv = system::iconpack::Version();
+        if (pv != m_packVer) { m_packVer = pv; for (auto& a : m_apps) { a.icon.Reset(); a.iconTried = false; } }
+    }
 
     MONITORINFO mi = {sizeof(mi)};
     GetMonitorInfoW(monitor, &mi);
@@ -810,8 +960,9 @@ void StartMenu::Show(HMONITOR monitor, int reservedPx) {
     const float s = m_scale;
 
     const int cx = (mi.rcMonitor.left + mi.rcMonitor.right) / 2;
-    const int bottom = mi.rcMonitor.bottom - reservedPx - static_cast<int>(6.0f * s);
-    SetWindowPos(m_hwnd, HWND_TOPMOST, cx - m_winW / 2, bottom - m_winH + static_cast<int>(m_pad), m_winW, m_winH, SWP_NOACTIVATE);
+    const int posY = g_barAtTop ? mi.rcMonitor.top + reservedPx + static_cast<int>(6.0f * s) - static_cast<int>(m_pad)
+                                : mi.rcMonitor.bottom - reservedPx - static_cast<int>(6.0f * s) - m_winH + static_cast<int>(m_pad);
+    SetWindowPos(m_hwnd, HWND_TOPMOST, cx - m_winW / 2, posY, m_winW, m_winH, SWP_NOACTIVATE);
 
     m_query.clear();
     m_powerOpen = false;
@@ -1002,10 +1153,25 @@ void StartMenu::BuildSearch() {
     }
     std::stable_sort(apps.begin(), apps.end(), [](auto& a, auto& b) { return a.first < b.first; });
 
-    // --- settings
+    // --- settings (Windows settings pages + classic tools; folded strings are cached, so a keystroke costs a few string searches)
     std::vector<int> settings;
-    for (int i = 0; i < static_cast<int>(ARRAYSIZE(kSettings)); ++i) {
-        if (Fold(kSettings[i].en).find(q) != std::wstring::npos || Fold(kSettings[i].tr).find(q) != std::wstring::npos) settings.push_back(i);
+    {
+        std::vector<std::wstring> words;
+        for (size_t b = 0; b < q.size();) {
+            const size_t e = q.find(L' ', b);
+            const size_t len = (e == std::wstring::npos ? q.size() : e) - b;
+            if (len) words.push_back(q.substr(b, len));
+            if (e == std::wstring::npos) break;
+            b = e + 1;
+        }
+        const auto& folds = SettingFolds();
+        std::vector<std::pair<int, int>> hits;
+        for (int i = 0; i < static_cast<int>(folds.size()); ++i) {
+            const int sc = ScoreSetting(folds[i], q, words);
+            if (sc < 9) hits.emplace_back(sc, i);
+        }
+        std::stable_sort(hits.begin(), hits.end(), [](auto& a, auto& b) { return a.first < b.first; });
+        for (auto& h : hits) settings.push_back(h.second);
     }
 
     // --- files (recent first, then the folder index)
@@ -1019,18 +1185,23 @@ void StartMenu::BuildSearch() {
     };
     scan(m_recents, 0);
     scan(m_files, 1);
-    std::stable_sort(files.begin(), files.end(), [&](auto& a, auto& b) {
-        if (a.first != b.first) return a.first < b.first;
-        const FileItem& fa = a.second.first == 0 ? m_recents[a.second.second] : m_files[a.second.second];
-        const FileItem& fb = b.second.first == 0 ? m_recents[b.second.second] : m_files[b.second.second];
-        return FtU64(fa.time) > FtU64(fb.time);
-    });
-    {   // drop duplicates (a recent file is also in the index)
-        std::unordered_set<std::wstring> seen;
+    {
+        // Only the best handful is shown: partial-sort a few dozen instead of sorting (and de-duplicating) every match - a one-letter
+        // query can hit thousands of files, and this runs on the UI thread for each keystroke.
+        const auto fileOf = [&](const std::pair<int, std::pair<int, int>>& f) -> const FileItem& {
+            return f.second.first == 0 ? m_recents[f.second.second] : m_files[f.second.second];
+        };
+        const size_t keep = std::min<size_t>(files.size(), 48);
+        std::partial_sort(files.begin(), files.begin() + keep, files.end(), [&](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first < b.first;
+            return FtU64(fileOf(a).time) > FtU64(fileOf(b).time);
+        });
+        files.resize(keep);
+        std::unordered_set<std::wstring> seen;                         // a recent file is usually also in the folder index
         std::vector<std::pair<int, std::pair<int, int>>> uniq;
         for (auto& f : files) {
-            const FileItem& fi = f.second.first == 0 ? m_recents[f.second.second] : m_files[f.second.second];
-            if (seen.insert(Fold(fi.path)).second) uniq.push_back(f);
+            if (uniq.size() >= 7) break;
+            if (seen.insert(Fold(fileOf(f).path)).second) uniq.push_back(f);
         }
         files.swap(uniq);
     }
@@ -1046,7 +1217,7 @@ void StartMenu::BuildSearch() {
     }
     if (!settings.empty()) {
         section(L"Settings", L"Ayarlar");
-        for (size_t i = 0; i < std::min<size_t>(4, settings.size()); ++i) { add(kSettingRow, settings[i], Rect{kPaneX, y, kPaneW, kRowH}); y += kRowH + 2; }
+        for (size_t i = 0; i < std::min<size_t>(5, settings.size()); ++i) { add(kSettingRow, settings[i], Rect{kPaneX, y, kPaneW, kRowH}); y += kRowH + 2; }
         y += 8;
     }
     if (!files.empty()) {
@@ -1206,10 +1377,14 @@ void StartMenu::ContextMenu(const Item& it) {
     std::vector<aether::ui::MenuEntry> items;
     items.push_back(aether::ui::MenuItem(1, i18n::Pick(L"Open", L"Aç"), 0xE8A7));
     const bool isApp = it.kind == kAppTile || it.kind == kAppRow;
-    std::wstring parse;
+    std::wstring parse, barPath;
     if (isApp && it.ref >= 0 && it.ref < static_cast<int>(m_apps.size())) {
         parse = m_apps[it.ref].parse;
         items.push_back(aether::ui::MenuItem(2, IsPinned(parse) ? i18n::Pick(L"Unpin from Start", L"Başlangıç'tan kaldır") : i18n::Pick(L"Pin to Start", L"Başlangıç'a sabitle"), 0xE718));
+        // a plain program is pinned by its .exe (so its windows group with the button); Store apps by their app id
+        const bool plainExe = parse.size() > 4 && _wcsicmp(parse.c_str() + parse.size() - 4, L".exe") == 0 && GetFileAttributesW(parse.c_str()) != INVALID_FILE_ATTRIBUTES;
+        barPath = plainExe ? parse : aether::system::AppsFolderPath(parse);
+        items.push_back(aether::ui::MenuItem(4, IsPinnedToBar(barPath) ? i18n::Pick(L"Unpin from bar", L"Çubuktan kaldır") : i18n::Pick(L"Pin to bar", L"Çubuğa sabitle"), 0xE718));
     } else {
         items.push_back(aether::ui::MenuItem(3, i18n::Pick(L"Open file location", L"Dosya konumunu aç"), 0xE838));
     }
@@ -1218,6 +1393,7 @@ void StartMenu::ContextMenu(const Item& it) {
     m_menuOpen = false;
     if (cmd == 1) LaunchItem(it);
     else if (cmd == 2 && !parse.empty()) TogglePin(parse);
+    else if (cmd == 4 && !barPath.empty()) { if (IsPinnedToBar(barPath)) UnpinFromBar(barPath); else PinToBar(barPath); }
     else if (cmd == 3) {
         const FileItem* f = nullptr;
         if (it.kind == kRecentRow && it.ref >= 0 && it.ref < static_cast<int>(m_recents.size())) f = &m_recents[it.ref];
@@ -1595,7 +1771,8 @@ void StartMenu::Render() {
                     } else if (it.kind == kSettingRow) {
                         Fill(ctx, ib, 9.0f * s, A(ui::kPurple, 0.28f));
                         DrawGlyph(ctx, ui::kGlyphSettings, RF(ib), ui::kPurpleLight);
-                        title = i18n::Pick(kSettings[it.ref].en, kSettings[it.ref].tr); sub = i18n::Pick(L"Settings", L"Ayarlar");
+                        title = i18n::Pick(kSettings[it.ref].en, kSettings[it.ref].tr);
+                        sub = kSettings[it.ref].tool ? i18n::Pick(L"Tool", L"Araç") : i18n::Pick(L"Settings", L"Ayarlar");
                     } else if (it.kind == kFileRow) {
                         FileItem& f = it.ref < 0 ? m_recents[-(it.ref + 1)] : m_files[it.ref];
                         if (!f.icon && !f.iconTried && iconBudget > 0) { EnsureFileIcon(f); --iconBudget; }

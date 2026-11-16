@@ -5,6 +5,7 @@
 #include "aether/core/i18n.hpp"
 #include "aether/render/context_menu.hpp"
 #include "aether/widgets/widget_window.hpp"
+#include "aether/system/trial.hpp"
 #include <ctime>
 #include <cmath>
 #include <cwchar>
@@ -206,8 +207,19 @@ void IslandWindow::PositionWindow() {
     m_windowHeight = static_cast<uint32_t>(kWindowH * m_dpiScale);
 
     const int screenW = mi.rcMonitor.right - mi.rcMonitor.left;
-    const int x = mi.rcMonitor.left + (screenW - static_cast<int>(m_windowWidth)) / 2;
-    const int y = mi.rcMonitor.top;
+    // The island is drawn in the middle of its (wider) window; the window moves so the island lands at the configured spot.
+    // Its centre stays far enough from the screen edges for the expanded pill to fit; the empty margins may hang off the screen.
+    const float posX = std::clamp(config::ConfigManager::Instance().Get().island.posX, 0.0f, 100.0f);
+    m_posApplied = posX;
+    const float halfExpanded = 210.0f * m_dpiScale + 8.0f * m_dpiScale;
+    const float centre = std::clamp(mi.rcMonitor.left + screenW * posX / 100.0f, mi.rcMonitor.left + halfExpanded, mi.rcMonitor.right - halfExpanded);
+    const int x = static_cast<int>(centre) - static_cast<int>(m_windowWidth) / 2;
+    const float posY = std::clamp(config::ConfigManager::Instance().Get().island.posY, 0.0f, 100.0f);
+    m_posYApplied = posY;
+    // The window is as tall as the biggest expanded state, so the whole travel range is "screen height - window height": at 100 % the expanded pill still fits.
+    const int screenH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    const int travel = std::max(0, screenH - static_cast<int>(m_windowHeight));
+    const int y = mi.rcMonitor.top + static_cast<int>(travel * posY / 100.0f);
     if (m_hwnd) {
         SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, static_cast<int>(m_windowWidth), static_cast<int>(m_windowHeight),
                      SWP_NOACTIVATE);
@@ -576,7 +588,7 @@ void IslandWindow::Update(float dt) {
         SetWindowDisplayAffinity(m_hwnd, affinity);
         m_affinityApplied = affinity;
     }
-    if (m_hwnd && cfg.monitorIndex != m_monitorApplied) {
+    if (m_hwnd && (cfg.monitorIndex != m_monitorApplied || cfg.island.posX != m_posApplied || cfg.island.posY != m_posYApplied)) {
         const uint32_t oldW = m_windowWidth, oldH = m_windowHeight;
         const float oldScale = m_dpiScale;
         PositionWindow();
@@ -1471,14 +1483,16 @@ LRESULT IslandWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             using namespace aether::ui;
             namespace i18n = aether::i18n;
             SetForegroundWindow(hwnd);
-            const int cmd = ShowContextMenu({
+            std::vector<MenuEntry> menu = {
                 MenuItem(1001, i18n::Pick(L"Open Settings Center", L"Ayar Merkezini Aç"), 0xE713),
                 MenuSeparator(),
                 MenuItem(1002, i18n::Pick(L"Toggle desktop widgets", L"Masaüstü widget'larını aç/kapat"), 0xE8A1),
                 MenuItem(1003, i18n::Pick(L"Cycle island mode", L"Ada modunu değiştir"), 0xE72C),
                 MenuItem(1004, i18n::Pick(L"Test notification", L"Bildirimi dene"), 0xEA8F),
                 MenuSeparator(),
-                MenuItem(1005, i18n::Pick(L"Exit Aether", L"Aether'den çık"), 0xE7E8, true)}, pt);
+                MenuItem(1005, i18n::Pick(L"Exit Aether", L"Aether'den çık"), 0xE7E8, true)};
+            if (system::trial::IsTrial()) menu.push_back(MenuItem(1006, i18n::Pick(L"End trial and remove Aether", L"Denemeyi bitir ve Aether'i kaldır"), 0xE74D, true));
+            const int cmd = ShowContextMenu(menu, pt);
 
             if (cmd == 1001) {
                 PostMessage(hwnd, WM_USER + 100, 0, 0);
@@ -1499,6 +1513,8 @@ LRESULT IslandWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 PushNotification(notif);
             } else if (cmd == 1005) {
                 PostQuitMessage(0);
+            } else if (cmd == 1006) {
+                system::trial::End();
             }
             return 0;
         }

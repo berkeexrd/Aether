@@ -19,6 +19,9 @@ struct NetState {
     int signal{0};           // Wi-Fi quality 0..100
     std::wstring name;       // SSID / adapter name
     std::wstring ip;
+    std::wstring adapter;    // adapter description, e.g. "Intel(R) Ethernet Connection"
+    unsigned long long linkMbps{0};   // negotiated link speed in Mbit/s (0 = unknown)
+    unsigned ifIndex{0};     // interface index of the active adapter (for traffic counters)
 };
 
 inline NetState QueryNetState() {
@@ -62,6 +65,9 @@ inline NetState QueryNetState() {
         st.wifi = best->IfType == IF_TYPE_IEEE80211;
         st.ethernet = !st.wifi;
         if (best->FriendlyName) st.name = best->FriendlyName;
+        if (best->Description) st.adapter = best->Description;
+        st.ifIndex = best->IfIndex;
+        if (best->TransmitLinkSpeed != 0 && best->TransmitLinkSpeed != static_cast<ULONG64>(-1)) st.linkMbps = best->TransmitLinkSpeed / 1000000ULL;
         for (auto* u = best->FirstUnicastAddress; u; u = u->Next) {
             if (u->Address.lpSockaddr->sa_family != AF_INET) continue;
             auto* sin = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr);

@@ -6,6 +6,8 @@
 #include <set>
 #include <algorithm>
 #include <thread>
+#include <ctime>
+#include "aether/core/crash.hpp"
 
 namespace aether::bar {
 
@@ -142,7 +144,7 @@ bool NotificationFeed::AppVisualFor(const std::wstring& appId, AppVisual& out) {
     std::lock_guard<std::mutex> l(g_appMtx);
     auto it = g_apps.find(appId);
     if (it != g_apps.end()) { out = it->second; return out.ready; }
-    if (g_appBusy.insert(appId).second) std::thread(ResolveApp, appId).detach();
+    if (g_appBusy.insert(appId).second) ::aether::core::SafeThread("app", [appId] { ResolveApp(appId); }).detach();
     return false;
 }
 
@@ -156,8 +158,38 @@ void NotificationFeed::DismissAll() {
 }
 
 void NotificationFeed::RequestRefresh() {
-    if (m_busy.exchange(true)) return;
-    std::thread([this] { Work(); m_busy = false; }).detach();
+    if (m_busy.exchange(true)) { m_again = true; return; }          // a refresh is running: do one more when it is done
+    ::aether::core::SafeThread("bg", [this] {
+        do { m_again = false; Work(); } while (m_again.load());
+        m_busy = false;
+    }).detach();
+}
+
+void NotificationFeed::StartWatching() {
+    if (m_watch.exchange(true)) return;
+    m_watcher = std::thread([this] {
+        wchar_t local[MAX_PATH] = {};
+        if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) { m_watch = false; return; }
+        const std::wstring base = std::wstring(local) + L"\\Microsoft\\Windows\\Notifications\\wpndatabase.db";
+        auto stamp = [](const std::wstring& p) -> unsigned long long {
+            WIN32_FILE_ATTRIBUTE_DATA d{};
+            if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &d)) return 0;
+            return ((static_cast<unsigned long long>(d.ftLastWriteTime.dwHighDateTime) << 32) | d.ftLastWriteTime.dwLowDateTime) ^ (static_cast<unsigned long long>(d.nFileSizeLow) * 1315423911ull);
+        };
+        unsigned long long last = 0; int idle = 0;
+        RequestRefresh();
+        while (m_watch) {
+            Sleep(200);
+            const unsigned long long s = stamp(base) * 31ull + stamp(base + L"-wal");
+            if (s != last) { last = s; idle = 0; RequestRefresh(); }
+            else if (++idle >= 15) { idle = 0; RequestRefresh(); }   // and every 3 s in any case
+        }
+    });
+}
+
+void NotificationFeed::StopWatching() {
+    m_watch = false;
+    if (m_watcher.joinable()) m_watcher.join();
 }
 
 void NotificationFeed::Work() {
@@ -227,6 +259,19 @@ void NotificationFeed::Work() {
     m_readable = ok;
     if (!ok) return;
     std::lock_guard<std::mutex> l(m_mutex);
+    {   // which ones are new since the last look? (the very first look only learns what is already there)
+        const long long nowUnix = static_cast<long long>(std::time(nullptr));
+        long long maxId = m_maxSeenId;
+        std::vector<NotifItem> fresh;
+        for (const auto& it : items) {
+            if (m_primed && it.id > m_maxSeenId && nowUnix - it.arrivalUnix < 90) fresh.push_back(it);
+            maxId = std::max(maxId, it.id);
+        }
+        m_maxSeenId = maxId; m_primed = true;
+        std::sort(fresh.begin(), fresh.end(), [](const NotifItem& a, const NotifItem& b) { return a.id < b.id; });
+        for (auto& f : fresh) m_fresh.push_back(std::move(f));
+        if (m_fresh.size() > 8) m_fresh.erase(m_fresh.begin(), m_fresh.end() - 8);
+    }
     items.erase(std::remove_if(items.begin(), items.end(), [&](const NotifItem& i) {
         return i.arrivalUnix <= m_clearedBefore || std::find(m_dismissed.begin(), m_dismissed.end(), i.id) != m_dismissed.end();
     }), items.end());

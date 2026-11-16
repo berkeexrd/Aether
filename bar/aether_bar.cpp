@@ -1,4 +1,6 @@
 #include "aether/bar/aether_bar.hpp"
+#include "aether/bar/window_preview.hpp"
+#include "aether/bar/bar_edge.hpp"
 #include "aether/bar/netstate.hpp"
 #include "aether/bar/start_menu.hpp"
 #include "aether/bar/flyouts.hpp"
@@ -9,6 +11,12 @@
 #include "aether/core/i18n.hpp"
 #include "aether/render/glass.hpp"
 #include "aether/core/monitors.hpp"
+#include "aether/system/shell_keys.hpp"
+#include "aether/system/app_identity.hpp"
+#include "aether/system/icon_pack.hpp"
+#include "aether/system/bar_pin_msg.hpp"
+#include <map>
+#include <unordered_map>
 #include <winsock2.h>
 #include <iphlpapi.h>
 #include <dwmapi.h>
@@ -106,9 +114,33 @@ struct PinStore {
     }
 };
 
+// A dropped item becomes a pin. A shortcut to a program is pinned as that program (so its windows group with the button);
+// a shortcut with arguments, a folder or any other file is pinned as it is and opens through the shell.
+std::wstring ResolvePinTarget(const std::wstring& path) {
+    const size_t dot = path.find_last_of(L'.');
+    const std::wstring ext = dot == std::wstring::npos ? L"" : path.substr(dot);
+    if (_wcsicmp(ext.c_str(), L".lnk") != 0) return path;
+    Microsoft::WRL::ComPtr<IShellLinkW> link;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) return path;
+    Microsoft::WRL::ComPtr<IPersistFile> file;
+    if (FAILED(link.As(&file)) || FAILED(file->Load(path.c_str(), STGM_READ))) return path;
+    link->Resolve(nullptr, SLR_NO_UI | SLR_NOUPDATE | SLR_NOSEARCH | SLR_NOTRACK);
+    wchar_t target[MAX_PATH * 2] = {}, args[1024] = {};
+    link->GetPath(target, ARRAYSIZE(target), nullptr, 0);
+    link->GetArguments(args, ARRAYSIZE(args));
+    const std::wstring t = target;
+    const bool exe = t.size() > 4 && _wcsicmp(t.c_str() + t.size() - 4, L".exe") == 0 && GetFileAttributesW(t.c_str()) != INVALID_FILE_ATTRIBUTES;
+    return (exe && !args[0]) ? t : path;
+}
+
+// The window list is refreshed several times a second: remember the image path of a process for a few seconds.
 std::wstring ExePathOf(HWND hwnd) {
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
+    struct Cached { std::wstring path; ULONGLONG tick; };
+    static std::unordered_map<DWORD, Cached> cache;
+    const ULONGLONG now = GetTickCount64();
+    if (auto it = cache.find(pid); it != cache.end() && now - it->second.tick < 10000) return it->second.path;
     std::wstring result;
     if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
         wchar_t buf[MAX_PATH * 2];
@@ -116,7 +148,33 @@ std::wstring ExePathOf(HWND hwnd) {
         if (QueryFullProcessImageNameW(h, 0, buf, &len)) result.assign(buf, len);
         CloseHandle(h);
     }
+    if (cache.size() > 400) cache.clear();
+    cache[pid] = {result, now};
     return result;
+}
+
+// exePath = what launches / pins the window's app (an .exe, or shell:AppsFolder\<AUMID> for Windows' own Store apps),
+// key     = what groups windows into one button.
+void IdentifyWindow(HWND h, std::wstring& exePath, std::wstring& key) {
+    const std::wstring proc = ExePathOf(h);
+    if (proc.empty() || system::IsApplicationFrameHost(proc)) {
+        const std::wstring aumid = system::WindowAumid(h);
+        if (!aumid.empty()) { exePath = system::AppsFolderPath(aumid); key = exePath; return; }
+        exePath.clear();
+        key = L"hwnd:" + std::to_wstring(reinterpret_cast<uintptr_t>(h));
+        return;
+    }
+    exePath = proc; key = proc;
+}
+
+// Friendly name of a pinned app ("Calculator" instead of "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App").
+std::wstring DisplayNameOf(const std::wstring& path) {
+    Microsoft::WRL::ComPtr<IShellItem> item;
+    if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item))) && item) {
+        PWSTR n = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &n)) && n) { std::wstring r = n; CoTaskMemFree(n); return r; }
+    }
+    return L"";
 }
 
 std::wstring FileTitle(const std::wstring& path) {
@@ -212,12 +270,43 @@ static void ForEachShellBar(void (*fn)(HWND)) {
     while ((sec = FindWindowExW(nullptr, sec, L"Shell_SecondaryTrayWnd", nullptr)) != nullptr) fn(sec);
 }
 
+// The stock taskbar's original state is written to %APPDATA%\Aether\taskbar-state.txt before it is changed and removed again on Restore().
+// If Aether is killed (task manager, uninstaller, crash) the file survives, so the next start / the uninstaller can still put the Windows taskbar back.
+static std::wstring TaskbarStateFile() {
+    wchar_t appdata[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata))) return L"";
+    std::wstring dir = std::wstring(appdata) + L"\\Aether";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\taskbar-state.txt";
+}
+static bool ReadSavedTaskbarState(UINT& out) {
+    const std::wstring f = TaskbarStateFile();
+    if (f.empty()) return false;
+    FILE* fp = _wfopen(f.c_str(), L"rt");
+    if (!fp) return false;
+    unsigned v = 0; const bool ok = fscanf(fp, "%u", &v) == 1;
+    fclose(fp);
+    if (ok) out = v;
+    return ok;
+}
+static void WriteSavedTaskbarState(UINT v) {
+    const std::wstring f = TaskbarStateFile();
+    if (f.empty()) return;
+    if (FILE* fp = _wfopen(f.c_str(), L"wt")) { fprintf(fp, "%u\n", v); fclose(fp); }
+}
+
 void ShellTaskbarGuard::Hide(bool hard) {
     HWND tray = StockTray();
     if (!tray) return;
     APPBARDATA abd = {sizeof(abd)};
     abd.hWnd = tray;
-    if (!m_hidden) m_prevState = static_cast<UINT>(SHAppBarMessage(ABM_GETSTATE, &abd));
+    if (!m_hidden) {
+        // a state file left behind by a run that was killed holds the REAL original state; the live state may already be our auto-hide
+        if (!ReadSavedTaskbarState(m_prevState)) {
+            m_prevState = static_cast<UINT>(SHAppBarMessage(ABM_GETSTATE, &abd));
+            WriteSavedTaskbarState(m_prevState);
+        }
+    }
     // Auto-hide releases the work area the stock bar reserved so ours can claim it.
     abd.lParam = static_cast<LPARAM>(m_prevState | ABS_AUTOHIDE);
     SHAppBarMessage(ABM_SETSTATE, &abd);
@@ -242,6 +331,7 @@ void ShellTaskbarGuard::Restore() {
         SHAppBarMessage(ABM_SETSTATE, &abd);
     }
     ForEachShellBar([](HWND h) { ShowWindow(h, SW_SHOWNA); });
+    if (m_hidden) { const std::wstring f = TaskbarStateFile(); if (!f.empty()) DeleteFileW(f.c_str()); }
     m_hidden = false;
 }
 
@@ -294,7 +384,7 @@ void AetherBar::PositionWindow() {
     m_windowH = static_cast<int>((kReserved + kTipRoom) * monScale);
     m_reservedPx = static_cast<int>(kReserved * monScale);
     if (m_hwnd) {
-        SetWindowPos(m_hwnd, HWND_TOPMOST, m_monRect.left, m_monRect.bottom - m_windowH, m_windowW, m_windowH, SWP_NOACTIVATE);
+        SetWindowPos(m_hwnd, HWND_TOPMOST, m_monRect.left, m_top ? m_monRect.top : m_monRect.bottom - m_windowH, m_windowW, m_windowH, SWP_NOACTIVATE);
     }
 }
 
@@ -306,16 +396,25 @@ bool AetherBar::Create() {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);  // harmless if already registered by the first bar
 
+    g_barAtTop = ReadTaskbarEdge() == 1;
+    m_top = g_barAtTop;
     PositionWindow();
     m_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-                             wc.lpszClassName, L"Aether Bar", WS_POPUP, m_monRect.left, m_monRect.bottom - m_windowH,
+                             wc.lpszClassName, L"Aether Bar", WS_POPUP, m_monRect.left, m_top ? m_monRect.top : m_monRect.bottom - m_windowH,
                              m_windowW, m_windowH, nullptr, nullptr, wc.hInstance, this);
     if (!m_hwnd) return false;
+    // the (non-elevated) shell talks to this elevated window: let its two messages through UIPI
+    ChangeWindowMessageFilterEx(m_hwnd, shellkeys::kMsgWinCombo, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(m_hwnd, shellkeys::kMsgActivate, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(m_hwnd, system::barpin::MsgHover(), MSGFLT_ALLOW, nullptr);   // items dragged in from the desktop
+    ChangeWindowMessageFilterEx(m_hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
 
     m_dcomp = std::make_unique<render::DCompLayer>();
     if (!m_dcomp->Initialize(m_hwnd, m_windowW, m_windowH)) return false;
     m_brush = m_dcomp->CreateSolidBrush(Color{1.0f, 1.0f, 1.0f, 1.0f});
     CreateFonts();
+    m_preview = std::make_unique<WindowPreview>();
+    if (!m_preview->Create([this](HWND w) { ActivateWindow(w); })) m_preview.reset();   // no preview, everything else keeps working
 
     m_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
     PinStore::I().Load();
@@ -359,10 +458,11 @@ void AetherBar::UnregisterAppBar() {
 void AetherBar::SetAppBarPos() {
     APPBARDATA abd = {sizeof(abd)};
     abd.hWnd = m_hwnd;
-    abd.uEdge = ABE_BOTTOM;
-    abd.rc = {m_monRect.left, m_monRect.bottom - m_reservedPx, m_monRect.right, m_monRect.bottom};
+    abd.uEdge = m_top ? ABE_TOP : ABE_BOTTOM;
+    abd.rc = m_top ? RECT{m_monRect.left, m_monRect.top, m_monRect.right, m_monRect.top + m_reservedPx}
+                   : RECT{m_monRect.left, m_monRect.bottom - m_reservedPx, m_monRect.right, m_monRect.bottom};
     SHAppBarMessage(ABM_QUERYPOS, &abd);
-    abd.rc.top = abd.rc.bottom - m_reservedPx;
+    if (m_top) abd.rc.bottom = abd.rc.top + m_reservedPx; else abd.rc.top = abd.rc.bottom - m_reservedPx;
     SHAppBarMessage(ABM_SETPOS, &abd);
 }
 
@@ -446,6 +546,10 @@ static ComPtr<ID2D1Bitmap1> ShellIconBitmap(ID2D1DeviceContext* ctx, const std::
 }
 
 ComPtr<ID2D1Bitmap1> AetherBar::LoadIcon(const Entry& e) {
+    if (system::iconpack::Active()) {                                   // the user's icon pack wins over the program's own icon
+        const std::wstring f = system::iconpack::Find(e.exePath);
+        if (!f.empty()) if (auto themed = system::iconpack::LoadBitmap(m_dcomp->GetContext(), f)) return themed;
+    }
     if (auto sharp = ShellIconBitmap(m_dcomp->GetContext(), e.exePath, 128)) return sharp;
     HICON icon = nullptr;
     bool owned = false;
@@ -503,7 +607,9 @@ void AetherBar::RefreshWindows() {
     for (const auto& p : store.pins) {
         if (!FindEntry(p)) {
             auto e = std::make_unique<Entry>();
-            e->key = p; e->exePath = p; e->label = FileTitle(p);
+            e->key = p; e->exePath = p;
+            e->label = system::IsAppsFolderPath(p) ? DisplayNameOf(p) : FileTitle(p);
+            if (e->label.empty()) e->label = FileTitle(p);
             m_entries.push_back(std::move(e));
         }
     }
@@ -512,15 +618,13 @@ void AetherBar::RefreshWindows() {
     for (HWND h : ctx.out) {
         // each bar lists only the windows that live on its own monitor
         if (MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) != m_mon) continue;
-        std::wstring exe = ExePathOf(h);
-        std::wstring key = exe;
-        if (exe.empty() || exe.find(L"ApplicationFrameHost.exe") != std::wstring::npos) {
-            key = L"hwnd:" + std::to_wstring(reinterpret_cast<uintptr_t>(h));
-        }
+        std::wstring exe, key;
+        IdentifyWindow(h, exe, key);
         Entry* e = FindEntry(key);
         if (!e) {
             auto ne = std::make_unique<Entry>();
-            ne->key = key; ne->exePath = exe; ne->label = exe.empty() ? WindowTitle(h) : FileTitle(exe);
+            ne->key = key; ne->exePath = exe;
+            ne->label = (exe.empty() || system::IsAppsFolderPath(exe)) ? WindowTitle(h) : FileTitle(exe);
             e = ne.get();
             m_entries.push_back(std::move(ne));
         }
@@ -528,17 +632,34 @@ void AetherBar::RefreshWindows() {
     }
 
     const ULONGLONG now = GetTickCount64();
+    {   // a different icon pack was chosen: forget every loaded icon so they come back in the new style
+        const unsigned pv = system::iconpack::Version();
+        if (pv != m_packVer) { m_packVer = pv; m_iconCache.clear(); for (auto& e : m_entries) { e->icon.Reset(); e->iconStamp = 0; } }
+    }
+    int loadBudget = 2;      // shell icon loads are slow: at most two per refresh, so a start-up with twenty apps never freezes the bar
     for (auto& e : m_entries) {
         e->appear.SetTarget((!e->Running() && !e->pinned) ? 0.0f : 1.0f);
         if (e->Running()) {
             const std::wstring t = WindowTitle(e->windows.front());
             if (!t.empty()) e->label = t;
         }
-        if (!e->icon || now - e->iconStamp > kIconRefreshMs) {
-            auto bmp = LoadIcon(*e);
-            if (bmp) e->icon = bmp;
-            e->iconStamp = now;
+        if (e->exePath.empty()) {                   // nothing to ask the shell: the window's own icon (apps change it at runtime)
+            if (!e->icon || now - e->iconStamp > kIconRefreshMs) {
+                auto bmp = LoadIcon(*e);
+                if (bmp) e->icon = bmp;
+                e->iconStamp = now;
+            }
+            continue;
         }
+        auto cached = m_iconCache.find(e->exePath);
+        const bool fresh = cached != m_iconCache.end() && cached->second && now - e->iconStamp <= kIconRefreshMs * 12;
+        if (fresh) { if (e->icon != cached->second) e->icon = cached->second; continue; }
+        if (loadBudget <= 0 || (!e->icon && e->iconStamp && now - e->iconStamp < 1500)) continue;     // retry a failed load only now and then
+        --loadBudget;
+        m_iconCache.erase(e->exePath);
+        auto bmp = LoadIcon(*e);
+        if (bmp) { m_iconCache[e->exePath] = bmp; e->icon = bmp; }
+        e->iconStamp = now;
     }
     m_entries.erase(std::remove_if(m_entries.begin(), m_entries.end(), [](const std::unique_ptr<Entry>& e) {
         return !e->pinned && !e->Running() && e->appear.GetValue() < 0.02f;
@@ -559,16 +680,26 @@ void AetherBar::RefreshWindows() {
 
 bool AetherBar::IsAnimating() const {
     if (!m_startHover.IsResting() || !m_dockAppear.IsResting()) return true;
+    if (m_dragging) return true;
+    if (m_pinHoverAmt > 0.01f || GetTickCount64() - m_pinHoverTick < 300) return true;
+    if (m_preview && m_preview->IsOpen()) return true;
     for (const auto& e : m_entries) {
-        if (!e->appear.IsResting() || !e->hover.IsResting() || !e->active.IsResting()) return true;
+        if (!e->appear.IsResting() || !e->hover.IsResting() || !e->active.IsResting() || e->slide != 0.0f) return true;
     }
     for (int k = 0; k < 16; ++k) if (m_hoverAmt[k] > 0.0f && m_hoverAmt[k] < 1.0f) return true;
     return std::abs(m_tipAlpha - (m_tipWanted ? 1.0f : 0.0f)) > 0.01f;
 }
 
 void AetherBar::Tick(float dt) {
+    SyncEdge(dt);
+    {
+        const bool over = GetTickCount64() - m_pinHoverTick < 300;      // the hover messages stop when the drag leaves or ends
+        m_pinHoverAmt += ((over ? 1.0f : 0.0f) - m_pinHoverAmt) * std::min(1.0f, dt * 14.0f);
+        if (!over && m_pinHoverAmt < 0.01f) m_pinHoverAmt = 0.0f;
+    }
+    UpdatePreview(dt);
     m_refreshTimer += dt;
-    if (m_refreshTimer >= 0.35f || m_pinVersion != PinStore::I().version) { m_refreshTimer = 0.0f; RefreshWindows(); }
+    if (!m_dragging && (m_refreshTimer >= 0.35f || m_pinVersion != PinStore::I().version)) { m_refreshTimer = 0.0f; RefreshWindows(); }
     m_keepHiddenTimer += dt;
     if (m_keepHiddenTimer >= 0.1f) { m_keepHiddenTimer = 0.0f; ShellTaskbarGuard::Instance().KeepHidden(); }
 
@@ -611,6 +742,10 @@ void AetherBar::Tick(float dt) {
         e.active.SetTarget(isActive ? 1.0f : 0.0f);
         e.hover.SetTarget((m_hoverKind == Hit::Item && m_hoverItem == i) ? 1.0f : 0.0f);
         e.appear.Update(dt); e.hover.Update(dt); e.active.Update(dt);
+        if (e.slide != 0.0f) {                       // gliding into the slot after a re-order
+            e.slide *= std::exp(-dt * 16.0f);
+            if (std::fabs(e.slide) < 0.4f) e.slide = 0.0f;
+        }
     }
     for (int k = 0; k < 16; ++k) {
         const float t = static_cast<int>(m_hoverKind) == k ? 1.0f : 0.0f;
@@ -628,8 +763,7 @@ void AetherBar::Tick(float dt) {
 void AetherBar::ComputeLayout() {
     const float s = m_dpi;
     const float h = kDockH * s;
-    const float bottom = static_cast<float>(m_windowH) - kMargin * s;
-    const float top = bottom - h;
+    const float top = m_top ? kMargin * s : static_cast<float>(m_windowH) - kMargin * s - h;
 
     float contentW = 0.0f;
     for (const auto& e : m_entries) contentW += (kItem + kGap) * s * e->appear.GetValue();
@@ -644,9 +778,26 @@ void AetherBar::ComputeLayout() {
     m_layout.items.assign(m_entries.size(), Rect{});
     m_layout.search = Rect{m_layout.start.Right() + 6 * s, top + (h - kItem * s) * 0.5f, kItem * s, kItem * s};
     float x = m_layout.search.Right() + kGap * s;
-    for (size_t i = 0; i < m_entries.size(); ++i) {
-        m_layout.items[i] = Rect{x, top + (h - kItem * s) * 0.5f, kItem * s, kItem * s};
-        x += (kItem + kGap) * s * m_entries[i]->appear.GetValue();
+    {
+        // while a button is dragged the others make room for it at the drop position
+        std::vector<int> order(m_entries.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int>(i);
+        const bool dragging = m_dragging && m_dragIdx >= 0 && m_dragIdx < static_cast<int>(order.size());
+        if (dragging) {
+            order.erase(order.begin() + m_dragIdx);
+            order.insert(order.begin() + std::clamp(m_dropIdx, 0, static_cast<int>(order.size())), m_dragIdx);
+        }
+        const float itemsLeft = x;
+        for (int k : order) {
+            m_layout.items[k] = Rect{x + m_entries[k]->slide, top + (h - kItem * s) * 0.5f, kItem * s, kItem * s};
+            x += (kItem + kGap) * s * m_entries[k]->appear.GetValue();
+        }
+        if (dragging) {                                           // the dragged button follows the cursor
+            const float dw = kItem * s;
+            Rect& r = m_layout.items[m_dragIdx];
+            r.x = std::clamp(m_mouse.x - dw * 0.5f, itemsLeft - dw * 0.5f, x - dw * 0.5f);
+            r.y += (m_top ? 6.0f : -6.0f) * s;
+        }
     }
 
     SYSTEM_POWER_STATUS ps{};
@@ -672,6 +823,68 @@ void AetherBar::ComputeLayout() {
     m_layout.weather = m_primary ? Rect{kMargin * s * 1.4f, top, 156.0f * s, h} : Rect{};
 }
 
+float AetherBar::LiftPx() const {
+    return (m_top ? -1.0f : 1.0f) * (1.0f - Clamp01(m_dockAppear.GetValue())) * 30.0f * m_dpi;
+}
+
+// Polls the taskbar position every 2 s (the user can move it in Windows' settings while we run).
+void AetherBar::SyncEdge(float dt) {
+    m_edgeTimer += dt;
+    if (m_edgeTimer < 2.0f) return;
+    m_edgeTimer = 0.0f;
+    const bool top = ReadTaskbarEdge() == 1;
+    g_barAtTop = top;
+    if (top != m_top) ApplyEdge(top);
+}
+
+void AetherBar::ApplyEdge(bool top) {
+    HidePreview();
+    m_top = top;
+    PositionWindow();
+    SetAppBarPos();
+    m_regionKey.clear();
+    ComputeLayout();
+    UpdateRegion();
+    RefreshBackdrop(true);
+}
+
+void AetherBar::HidePreview() {
+    if (m_preview) m_preview->Hide();
+    m_prevItem = -1; m_hoverDwell = 0.0f; m_leaveDwell = 0.0f;
+}
+
+// Hover on a running app's button opens its window preview after a short delay (instantly when moving from one app to the next);
+// it closes shortly after the cursor left both the button and the preview.
+void AetherBar::UpdatePreview(float dt) {
+    if (!m_preview) return;
+    const bool open = m_preview->IsOpen();
+    const bool onItem = !m_dragging && m_hoverKind == Hit::Item && m_hoverItem >= 0 && m_hoverItem < static_cast<int>(m_entries.size()) &&
+                        m_entries[m_hoverItem]->Running() && !m_entries[m_hoverItem]->windows.empty() &&
+                        m_hoverItem < static_cast<int>(m_layout.items.size());
+    if (onItem) {
+        m_leaveDwell = 0.0f;
+        if (m_prevItem != m_hoverItem) { m_prevItem = m_hoverItem; m_hoverDwell = 0.0f; }
+        m_hoverDwell += dt;
+        const Entry& e = *m_entries[m_hoverItem];
+        const bool sameApp = open && IEqual(m_prevKey, e.key);
+        if (sameApp) {
+            m_prevSync += dt;
+            if (m_prevSync >= 0.4f) { m_prevSync = 0.0f; m_preview->SetWindows(e.windows); }
+        } else if ((open && m_hoverDwell >= 0.05f) || m_hoverDwell >= 0.45f) {
+            m_prevKey = e.key; m_prevSync = 0.0f;
+            RECT wr; GetWindowRect(m_hwnd, &wr);
+            const float cx = wr.left + m_layout.items[m_hoverItem].Center().x;
+            m_preview->Show(m_mon, cx, wr.top + static_cast<int>(m_top ? m_layout.dock.Bottom() : m_layout.dock.Top()), m_top, e.exePath, e.windows);
+        }
+        return;
+    }
+    m_prevItem = -1; m_hoverDwell = 0.0f;
+    if (!open) return;
+    if (m_preview->Hovered()) { m_leaveDwell = 0.0f; return; }
+    m_leaveDwell += dt;
+    if (m_leaveDwell >= 0.30f) HidePreview();
+}
+
 void AetherBar::ComputeTooltip() {
     std::wstring text;
     float anchor = 0.0f;
@@ -680,7 +893,8 @@ void AetherBar::ComputeTooltip() {
     } else {
         switch (m_hoverKind) {
             case Hit::Item:
-                if (m_hoverItem >= 0 && m_hoverItem < static_cast<int>(m_entries.size())) {
+                if (m_preview && m_preview->IsOpen()) break;          // the preview already names the windows
+                if (m_hoverItem >= 0 && m_hoverItem < static_cast<int>(m_entries.size()) && m_hoverItem < static_cast<int>(m_layout.items.size())) {
                     text = m_entries[m_hoverItem]->label.empty() ? L"App" : m_entries[m_hoverItem]->label;
                     anchor = m_layout.items[m_hoverItem].Center().x;
                 }
@@ -715,7 +929,8 @@ void AetherBar::ComputeTooltip() {
             DWRITE_TEXT_METRICS m{}; tl->GetMetrics(&m); tw = m.widthIncludingTrailingWhitespace;
         }
         const float w = std::min(tw + 28.0f * s, 340.0f * s), h = 30.0f * s;
-        Rect r{m_tipAnchor - w / 2, m_layout.dock.Top() - h - 10.0f * s + (1.0f - m_tipAlpha) * 6.0f * s, w, h};
+        Rect r{m_tipAnchor - w / 2, m_top ? m_layout.dock.Bottom() + 10.0f * s - (1.0f - m_tipAlpha) * 6.0f * s
+                                      : m_layout.dock.Top() - h - 10.0f * s + (1.0f - m_tipAlpha) * 6.0f * s, w, h};
         r.x = std::clamp(r.x, 8.0f * s, static_cast<float>(m_windowW) - w - 8.0f * s);
         m_tipRect = r;
     }
@@ -725,7 +940,7 @@ void AetherBar::ComputeTooltip() {
 // NOT be made click-through with HTTRANSPARENT, so only the pills (and tooltip) are part of the window.
 void AetherBar::UpdateRegion() {
     const float s = m_dpi;
-    const float lift = (1.0f - Clamp01(m_dockAppear.GetValue())) * 30.0f * s;
+    const float lift = LiftPx();
     auto box = [&](const Rect& r, float padX, float padTop, float padBottom, std::vector<int>& key, int out[4]) {
         out[0] = static_cast<int>(r.Left() - padX);
         out[1] = static_cast<int>(r.Top() - padTop + lift);
@@ -902,12 +1117,27 @@ void AetherBar::Render() {
 
     auto ctx = m_dcomp->BeginDraw();
     if (!ctx) return;
-    const float dockA = Clamp01(m_dockAppear.GetValue());
-    ctx->SetTransform(D2D1::Matrix3x2F::Translation(0, (1.0f - dockA) * 30.0f * s));
+    ctx->SetTransform(D2D1::Matrix3x2F::Translation(0, LiftPx()));
     render::DrawGlassGlow(ctx, silhouette.Get(), s, 0.75f);
 
     // ---- dock -----------------------------------------------------------------------------------
     DrawPill(ctx, m_layout.dock, 24.0f * s);
+    if (m_pinHoverAmt > 0.01f) {                    // items are being carried over the dock: light it up and show where they would land
+        const float a = m_pinHoverAmt;
+        const auto& ac = render::glass::kVioletLight;
+        if (auto g = m_dcomp->CreateSquircleGeometry(m_layout.dock, 24.0f * s)) {
+            m_brush->SetColor(D2D1::ColorF(ac.r, ac.g, ac.b, 0.10f * a));
+            ctx->FillGeometry(g.Get(), m_brush.Get());
+            m_brush->SetColor(D2D1::ColorF(ac.r, ac.g, ac.b, 0.70f * a));
+            ctx->DrawGeometry(g.Get(), m_brush.Get(), 1.6f * s);
+        }
+        const float ly = m_layout.dock.y + 9.0f * s, lh = m_layout.dock.height - 18.0f * s;
+        for (int k = 2; k >= 0; --k) {                // soft glow around the insertion line
+            const float w = (3.0f + 5.0f * k) * s;
+            m_brush->SetColor(D2D1::ColorF(ac.r, ac.g, ac.b, (k == 0 ? 0.95f : 0.14f) * a));
+            ctx->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(m_pinLineX - w * 0.5f, ly, m_pinLineX + w * 0.5f, ly + lh), w * 0.5f, w * 0.5f), m_brush.Get());
+        }
+    }
 
     const float sh = m_startHover.GetValue();
     if (!render::glass::CurrentTheme().flat) {
@@ -988,15 +1218,26 @@ void AetherBar::Render() {
         if (e.Running()) {
             // thin lilac "light line" hugging the bottom rim: bright centre fading to both ends + soft bloom
             const float dw = (14.0f + 8.0f * act) * s, dh = 2.2f * s;
-            const float dy = m_layout.dock.Bottom() - 6.0f * s;
+            const float dy = m_top ? m_layout.dock.Top() + 6.0f * s : m_layout.dock.Bottom() - 6.0f * s;
             const Color ind = render::glass::kVioletLight;
             const float gl = (0.35f + 0.65f * act) * appear;
+            const int nWin = std::min<int>(4, static_cast<int>(e.windows.size()));
             if (auto bl = m_dcomp->CreateRadialGradientBrush(render::glass::A(ind, 0.34f * gl), render::glass::A(ind, 0.0f), D2D1::Point2F(c.x, dy), dw * 0.95f, 5.5f * s))
                 ctx->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x, dy), dw * 0.95f, 5.5f * s), bl.Get());
-            if (auto ln = m_dcomp->CreateLinearGradientBrush({{0.0f, render::glass::A(ind, 0.0f)}, {0.28f, render::glass::A(ind, (0.60f + 0.35f * act) * appear)},
-                                                              {0.72f, render::glass::A(ind, (0.60f + 0.35f * act) * appear)}, {1.0f, render::glass::A(ind, 0.0f)}},
-                                                             D2D1::Point2F(c.x - dw / 2, dy), D2D1::Point2F(c.x + dw / 2, dy)))
-                ctx->FillRoundedRectangle(D2D1::RoundedRect(RF(c.x - dw / 2, dy - dh / 2, c.x + dw / 2, dy + dh / 2), dh / 2, dh / 2), ln.Get());
+            if (nWin <= 1) {
+                if (auto ln = m_dcomp->CreateLinearGradientBrush({{0.0f, render::glass::A(ind, 0.0f)}, {0.28f, render::glass::A(ind, (0.60f + 0.35f * act) * appear)},
+                                                                  {0.72f, render::glass::A(ind, (0.60f + 0.35f * act) * appear)}, {1.0f, render::glass::A(ind, 0.0f)}},
+                                                                 D2D1::Point2F(c.x - dw / 2, dy), D2D1::Point2F(c.x + dw / 2, dy)))
+                    ctx->FillRoundedRectangle(D2D1::RoundedRect(RF(c.x - dw / 2, dy - dh / 2, c.x + dw / 2, dy + dh / 2), dh / 2, dh / 2), ln.Get());
+            } else {
+                // several windows: one short dash per window, so a glance tells how many are open (more than four: the fourth dash is full-bright)
+                const float seg = 5.0f * s, gap = 3.0f * s;
+                const float total = nWin * seg + (nWin - 1) * gap;
+                float sx = c.x - total / 2;
+                m_brush->SetColor(D2D1::ColorF(ind.r, ind.g, ind.b, (0.62f + 0.38f * act) * appear));
+                for (int k = 0; k < nWin; ++k, sx += seg + gap)
+                    ctx->FillRoundedRectangle(D2D1::RoundedRect(RF(sx, dy - dh / 2, sx + seg, dy + dh / 2), dh / 2, dh / 2), m_brush.Get());
+            }
         }
     }
 
@@ -1132,11 +1373,11 @@ void AetherBar::Render() {
 
 AetherBar::Hit AetherBar::HitTest(const Vec2& pt, int& index) const {
     index = -1;
-    const float lift = (1.0f - Clamp01(m_dockAppear.GetValue())) * 30.0f * m_dpi;
-    const Vec2 p{pt.x, pt.y - lift};
+    const Vec2 p{pt.x, pt.y - LiftPx()};
     if (m_layout.start.Contains(p)) return Hit::Start;
     if (m_layout.search.Contains(p)) return Hit::Search;
-    for (size_t i = 0; i < m_layout.items.size(); ++i) {
+    const size_t nItems = std::min(m_layout.items.size(), m_entries.size());     // the layout can lag one frame behind the entry list
+    for (size_t i = 0; i < nItems; ++i) {
         if (m_entries[i]->appear.GetValue() > 0.5f && m_layout.items[i].Contains(p)) { index = static_cast<int>(i); return Hit::Item; }
     }
     if (m_layout.chevron.width > 0 && m_layout.chevron.Contains(p)) return Hit::Chevron;
@@ -1161,9 +1402,32 @@ void AetherBar::ActivateWindow(HWND hwnd) {
     if (fgThread && fgThread != me) AttachThreadInput(me, fgThread, FALSE);
 }
 
+void AetherBar::LaunchEntry(Entry& e) {
+    if (e.exePath.empty()) return;
+    e.launchTick = GetTickCount64();
+    ShellExecuteW(nullptr, L"open", e.exePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// Every top-level window of an entry's app on ANY monitor (the entry itself only holds the ones on its own bar).
+std::vector<HWND> AetherBar::WindowsOfEntryEverywhere(const Entry& e) {
+    std::vector<HWND> out;
+    EnumCtx ctx{{}, m_hwnd};
+    EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&ctx));
+    for (HWND h : ctx.out) {
+        std::wstring exe, key;
+        IdentifyWindow(h, exe, key);
+        if (IEqual(key, e.key)) out.push_back(h);
+    }
+    return out;
+}
+
 void AetherBar::OnItemClick(Entry& e) {
     if (!e.Running()) {
-        ShellExecuteW(nullptr, L"open", e.exePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        // Not running on THIS monitor does not mean not running: bring the window from the other monitor instead of starting a second copy.
+        const std::vector<HWND> elsewhere = WindowsOfEntryEverywhere(e);
+        if (!elsewhere.empty()) { ActivateWindow(elsewhere.front()); return; }
+        if (GetTickCount64() - e.launchTick < 3000) return;          // a double click must not start the app twice
+        LaunchEntry(e);
         return;
     }
     HWND fg = GetForegroundWindow();
@@ -1176,6 +1440,115 @@ void AetherBar::OnItemClick(Entry& e) {
     }
     e.cycle = (e.cycle + 1) % static_cast<int>(e.windows.size());
     ActivateWindow(e.windows[e.cycle]);
+}
+
+// ---- drag & drop re-ordering of the buttons ---------------------------------------------------------------------------
+// Pinned apps stay in the pinned block (their new order is saved), the others can be re-ordered among themselves.
+void AetherBar::BeginDrag() {
+    if (m_downIdx < 0 || m_downIdx >= static_cast<int>(m_entries.size())) return;
+    m_dragging = true;
+    HidePreview();
+    m_dragIdx = m_dropIdx = m_downIdx;
+    m_hoverKind = Hit::None; m_hoverItem = -1;
+}
+
+void AetherBar::UpdateDrag() {
+    const int n = static_cast<int>(m_entries.size());
+    if (!m_dragging || m_dragIdx < 0 || m_dragIdx >= n) return;
+    int pinnedCount = 0;
+    for (const auto& e : m_entries) if (e->pinned) ++pinnedCount;
+    const bool pinned = m_entries[m_dragIdx]->pinned;
+    const int lo = pinned ? 0 : pinnedCount, hi = pinned ? pinnedCount - 1 : n - 1;
+    if (hi < lo) return;
+    const float pitch = (kItem + kGap) * m_dpi;
+    const float first = m_layout.search.Right() + kGap * m_dpi;             // left edge of the first button
+    const int target = std::clamp(static_cast<int>(std::floor((m_mouse.x - first) / pitch)), lo, hi);
+    ApplyDropIndex(target);
+}
+
+void AetherBar::ApplyDropIndex(int target) {
+    if (target == m_dropIdx) return;
+    const int n = static_cast<int>(m_entries.size());
+    ComputeLayout();
+    std::vector<float> before(n, 0.0f);
+    for (int k = 0; k < n && k < static_cast<int>(m_layout.items.size()); ++k) before[k] = m_layout.items[k].x;
+    m_dropIdx = target;
+    ComputeLayout();
+    for (int k = 0; k < n && k < static_cast<int>(m_layout.items.size()); ++k)   // everybody glides from where it was drawn to where it now belongs
+        if (k != m_dragIdx) m_entries[k]->slide += before[k] - m_layout.items[k].x;
+}
+
+void AetherBar::EndDrag(bool commit) {
+    if (!m_dragging) return;
+    const int n = static_cast<int>(m_entries.size());
+    ComputeLayout();
+    const float drawnX = (m_dragIdx >= 0 && m_dragIdx < static_cast<int>(m_layout.items.size())) ? m_layout.items[m_dragIdx].x : 0.0f;
+    m_dragging = false;
+    if (commit && m_dragIdx >= 0 && m_dragIdx < n && m_dropIdx >= 0 && m_dropIdx < n && m_dropIdx != m_dragIdx) {
+        auto moved = std::move(m_entries[m_dragIdx]);
+        m_entries.erase(m_entries.begin() + m_dragIdx);
+        m_entries.insert(m_entries.begin() + m_dropIdx, std::move(moved));
+        PinStore& store = PinStore::I();
+        if (m_entries[m_dropIdx]->pinned) {                                       // persist the new order of the pinned apps
+            std::vector<std::wstring> pins;
+            for (const auto& e : m_entries) if (e->pinned) pins.push_back(e->exePath);
+            store.pins = pins;
+            store.Save();
+        }
+        ComputeLayout();
+        if (m_dropIdx < static_cast<int>(m_layout.items.size())) m_entries[m_dropIdx]->slide = drawnX - m_layout.items[m_dropIdx].x;   // glide into the slot
+    } else if (m_dragIdx >= 0 && m_dragIdx < n) {
+        ComputeLayout();
+        if (m_dragIdx < static_cast<int>(m_layout.items.size())) m_entries[m_dragIdx]->slide = drawnX - m_layout.items[m_dragIdx].x;
+    }
+    m_dragIdx = m_dropIdx = -1;
+}
+
+bool PinToBar(const std::wstring& path) {
+    PinStore& st = PinStore::I(); st.Load();
+    if (path.empty() || st.IndexOf(path) >= 0) return false;
+    st.pins.push_back(path); st.Save();
+    return true;
+}
+bool IsPinnedToBar(const std::wstring& path) { PinStore& st = PinStore::I(); st.Load(); return st.IndexOf(path) >= 0; }
+void UnpinFromBar(const std::wstring& path) {
+    PinStore& st = PinStore::I(); st.Load();
+    const int i = st.IndexOf(path);
+    if (i >= 0) { st.pins.erase(st.pins.begin() + i); st.Save(); }
+}
+
+// ---- pinning by drop ------------------------------------------------------------------------------------------------------
+int AetherBar::PinSlotAt(float screenX) const {
+    int pinned = 0;
+    for (const auto& e : m_entries) if (e->pinned) ++pinned;
+    RECT wr{}; GetWindowRect(m_hwnd, &wr);
+    const float x = screenX - static_cast<float>(wr.left);
+    const float pitch = (kItem + kGap) * m_dpi;
+    const float first = m_layout.search.Right() + kGap * m_dpi;
+    return std::clamp(static_cast<int>(std::floor((x - first) / pitch + 0.5f)), 0, pinned);
+}
+
+void AetherBar::OnPinHover(int sx, int) {
+    m_pinHoverTick = GetTickCount64();
+    m_pinSlot = PinSlotAt(static_cast<float>(sx));
+    const float pitch = (kItem + kGap) * m_dpi;
+    m_pinLineX = m_layout.search.Right() + kGap * m_dpi + pitch * static_cast<float>(m_pinSlot) - kGap * m_dpi * 0.5f;
+}
+
+void AetherBar::AddPins(const std::vector<std::wstring>& paths, int screenX) {
+    PinStore& store = PinStore::I();
+    store.Load();
+    int slot = std::min(PinSlotAt(static_cast<float>(screenX)), static_cast<int>(store.pins.size()));
+    bool changed = false;
+    for (const auto& raw : paths) {
+        const std::wstring target = ResolvePinTarget(raw);
+        if (target.empty() || GetFileAttributesW(target.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        if (store.IndexOf(target) >= 0) continue;                                   // already pinned
+        store.pins.insert(store.pins.begin() + slot++, target);
+        changed = true;
+    }
+    m_pinHoverTick = 0;
+    if (changed) store.Save();                                                      // every bar rebuilds its buttons on the next tick
 }
 
 void AetherBar::AdjustVolume(float delta) {
@@ -1203,7 +1576,7 @@ void AetherBar::ShowItemMenu(int index) {
     if (e.Running()) items.push_back(aether::ui::MenuItem(3, e.windows.size() > 1 ? i18n::Pick(L"Close all windows", L"Tüm pencereleri kapat") : i18n::Pick(L"Close window", L"Pencereyi kapat"), 0xE711, true));
     const int cmd = aether::ui::ShowContextMenu(items, pt, true);
     PinStore& store = PinStore::I();
-    if (cmd == 1 && !e.exePath.empty()) ShellExecuteW(nullptr, L"open", e.exePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (cmd == 1 && !e.exePath.empty()) LaunchEntry(e);
     else if (cmd == 2) {
         const int idx = store.IndexOf(e.exePath);
         if (idx >= 0) store.pins.erase(store.pins.begin() + idx); else store.pins.push_back(e.exePath);
@@ -1237,11 +1610,37 @@ void AetherBar::ShowBarMenu() {
 }
 
 LRESULT AetherBar::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == shellkeys::kMsgWinCombo) { shellkeys::g_winComboTick = GetTickCount64(); return 0; }
+    if (msg == shellkeys::kMsgActivate) {
+        HWND target = reinterpret_cast<HWND>(wp);
+        if (target && IsWindow(target)) ActivateWindow(target);
+        return 0;
+    }
     if (m_taskbarCreatedMsg && msg == m_taskbarCreatedMsg) {
         PostThreadMessageW(GetCurrentThreadId(), WM_APP + 3, 0, 0);   // manager re-applies the guard
         return 0;
     }
+    if (msg == system::barpin::MsgHover()) { OnPinHover(static_cast<int>(wp), static_cast<int>(lp)); return 0; }
     switch (msg) {
+        case WM_COPYDATA: {
+            const auto* cds = reinterpret_cast<const COPYDATASTRUCT*>(lp);
+            if (!cds || cds->dwData != system::barpin::kDropData || !cds->lpData || cds->cbData < sizeof(wchar_t)) break;
+            const std::wstring blob(static_cast<const wchar_t*>(cds->lpData), cds->cbData / sizeof(wchar_t));
+            std::vector<std::wstring> lines; size_t from = 0;
+            while (from < blob.size()) {
+                size_t to = blob.find(L'\n', from);
+                if (to == std::wstring::npos) to = blob.size();
+                std::wstring ln = blob.substr(from, to - from);
+                if (!ln.empty() && ln.back() == L'\0') ln.pop_back();
+                if (!ln.empty()) lines.push_back(ln);
+                from = to + 1;
+            }
+            if (lines.size() < 2) return TRUE;
+            const int sx = _wtoi(lines[0].c_str());
+            lines.erase(lines.begin());
+            AddPins(lines, sx);
+            return TRUE;
+        }
         case WM_APPBAR:
             if (wp == ABN_POSCHANGED) SetAppBarPos();
             else if (wp == ABN_FULLSCREENAPP) {
@@ -1275,7 +1674,11 @@ LRESULT AetherBar::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_MOUSEMOVE: {
             m_mouse = Vec2{static_cast<float>(GET_X_LPARAM(lp)), static_cast<float>(GET_Y_LPARAM(lp))};
-            m_hoverKind = HitTest(m_mouse, m_hoverItem);
+            if (m_downIdx >= 0 && (wp & MK_LBUTTON)) {           // left button held on a button: start / continue a drag
+                if (!m_dragging && (std::fabs(m_mouse.x - m_downPt.x) > 8.0f * m_dpi || std::fabs(m_mouse.y - m_downPt.y) > 8.0f * m_dpi)) BeginDrag();
+                if (m_dragging) UpdateDrag();
+            }
+            if (!m_dragging) m_hoverKind = HitTest(m_mouse, m_hoverItem);
             if (!m_trackingMouse) {
                 TRACKMOUSEEVENT t = {sizeof(t), TME_LEAVE, hwnd, 0};
                 TrackMouseEvent(&t);
@@ -1296,13 +1699,32 @@ LRESULT AetherBar::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        case WM_LBUTTONDOWN: {
+            int idx;
+            const Vec2 pt{static_cast<float>(GET_X_LPARAM(lp)), static_cast<float>(GET_Y_LPARAM(lp))};
+            const Hit h = HitTest(pt, idx);
+            m_downIdx = (h == Hit::Item) ? idx : -1;
+            m_downPt = pt;
+            HidePreview();
+            if (m_downIdx >= 0) SetCapture(hwnd);                 // keep the drag alive when the cursor leaves the bar's shape
+            return 0;
+        }
+        case WM_CAPTURECHANGED:
+            if (m_dragging) EndDrag(false);
+            m_downIdx = -1;
+            return 0;
         case WM_LBUTTONUP: {
+            if (m_dragging) { EndDrag(true); ReleaseCapture(); m_downIdx = -1; return 0; }
+            const int pressedOn = m_downIdx;
+            m_downIdx = -1;
+            if (GetCapture() == hwnd) ReleaseCapture();
             int idx;
             const Hit h = HitTest(Vec2{static_cast<float>(GET_X_LPARAM(lp)), static_cast<float>(GET_Y_LPARAM(lp))}, idx);
+            if (h == Hit::Item && pressedOn >= 0 && idx != pressedOn) return 0;     // pressed on one button, released on another: not a click
             switch (h) {
                 case Hit::Start:   if (m_start) m_start->Toggle(m_mon, m_reservedPx); break;
                 case Hit::Search:  if (m_start && !m_start->IsOpen()) m_start->Show(m_mon, m_reservedPx); break;   // opens with the search box focused
-                case Hit::Item:    OnItemClick(*m_entries[idx]); break;
+                case Hit::Item:    if (idx >= 0 && idx < static_cast<int>(m_entries.size())) OnItemClick(*m_entries[idx]); break;
                 case Hit::Chevron: ToggleFlyout(m_tray, m_layout.chevron); break;      // Aether tray
                 case Hit::Quick:   ToggleFlyout(m_quick, m_layout.quick); break;       // quick settings
                 case Hit::Network: ToggleFlyout(m_net, m_layout.network); break;       // own network centre
@@ -1322,7 +1744,7 @@ LRESULT AetherBar::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MBUTTONUP: {
             int idx;
             const Hit h = HitTest(Vec2{static_cast<float>(GET_X_LPARAM(lp)), static_cast<float>(GET_Y_LPARAM(lp))}, idx);
-            if (h == Hit::Item && !m_entries[idx]->exePath.empty()) {
+            if (h == Hit::Item && idx >= 0 && idx < static_cast<int>(m_entries.size()) && !m_entries[idx]->exePath.empty()) {
                 ShellExecuteW(nullptr, L"open", m_entries[idx]->exePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             } else if (h == Hit::Quick) {
                 if (auto ev = DefaultEndpointVolume()) { ev->SetMute(!m_muted, nullptr); m_muted = !m_muted; }
@@ -1332,6 +1754,7 @@ LRESULT AetherBar::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_RBUTTONUP: {
             int idx;
             const Hit h = HitTest(Vec2{static_cast<float>(GET_X_LPARAM(lp)), static_cast<float>(GET_Y_LPARAM(lp))}, idx);
+            HidePreview();
             if (h == Hit::Item) ShowItemMenu(idx); else ShowBarMenu();
             return 0;
         }
@@ -1347,7 +1770,9 @@ bool AetherBar::Frame(float dt) {
     render::glass::SyncTheme();
     if (!m_hwnd) return false;
     Tick(dt);
-    const bool animating = IsAnimating();
+    if (m_layout.items.size() != m_entries.size()) ComputeLayout();    // entries were added / removed: never leave the layout stale
+    const bool previewAnim = m_preview && m_preview->Frame(dt);
+    const bool animating = IsAnimating() || previewAnim;
     m_idleRender += dt;
     if (animating || m_idleRender >= 0.5f || m_hoverKind != Hit::None) {
         m_idleRender = 0.0f;

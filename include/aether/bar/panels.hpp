@@ -43,7 +43,7 @@ private:
 // Network centre: Wi-Fi switch, current connection, scanned networks, connect with password.
 class NetPanel : public Flyout {
 public:
-    NetPanel() { m_baseW = 392; m_baseH = 620; }
+    NetPanel() { m_baseW = 392; m_baseH = 664; }
 protected:
     void OnShow() override;
     void OnTick(float dt) override;
@@ -54,6 +54,18 @@ protected:
     void OnKey(WPARAM vk) override;
 private:
     void Bars(ID2D1DeviceContext*, float x, float y, float h, int signal, const core::Color& c);
+    void RefreshNet();                                  // active connection, cached (the query is not cheap, so it runs every couple of seconds, not every frame)
+    // cached connection details + live traffic of the active adapter
+    bool m_conn{false}, m_inet{false}, m_wifi{false}, m_eth{false};
+    int m_sig{0};
+    std::wstring m_nname, m_nip, m_adapter;
+    unsigned long long m_link{0}, m_lastRx{0}, m_lastTx{0};
+    unsigned m_if{0}, m_lastIf{0};
+    bool m_haveLast{false};
+    double m_rx{0}, m_tx{0};
+    float m_nsT{0}, m_sampleT{0}, m_histMax{125000.0f};
+    static constexpr int kHist = 44;
+    float m_hist[kHist] = {};
     float m_scroll{0}, m_scrollTarget{0}, m_poll{0}, m_shown{0}, m_switch{1.0f}, m_expand{0};
     std::wstring m_sel, m_pass;
     bool m_selSecure{false};
