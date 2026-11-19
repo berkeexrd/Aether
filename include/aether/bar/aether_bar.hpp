@@ -83,6 +83,11 @@ public:
 
 private:
     static constexpr UINT WM_APPBAR = WM_USER + 1;
+public:
+    // Showcase recording (Aether.exe --record): opens a flyout of the primary bar without having to click it. WPARAM: 0 = close all, 1 = quick settings,
+    // 2 = calendar, 3 = tray, 4 = weather, 5 = notifications, 6 = open the Start menu, 7 = close it.
+    static constexpr UINT kMsgDemoFlyout = WM_APP + 30;
+private:
     enum class Hit { None, Start, Search, Item, Chevron, Quick, Network, Lang, Clock, Bell, Weather, Desktop, Right, Dock };
 
     struct LayoutInfo {

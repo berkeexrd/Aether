@@ -25,6 +25,7 @@ Aether, aynı görünümü paylaşan küçük programlardan oluşur. Windows'un 
 
 - **Dynamic Island**: boşta, müzik, sistem, ses ve bildirim durumları arasında yay fiziğiyle dönüşen hap; canlı medya kontrolü.
 - **Görev çubuğu**: çok monitörlü dock, özel Başlat menüsü, gerçek sistem tepsisi, hızlı ayarlar, ağ merkezi (Wi-Fi, WPA2/WPA3), bildirim merkezi, hava durumu, takvim.
+- **Ses göstergesi ve Windows'tan bağımsızlık**: ses değişince çubuğun üstünde cam bir gösterge çıkar; ses tuşlarını çubuk kendisi işler. Çubuk çalışırken Windows'un Başlat, Arama, Widget'lar ve hızlı ayarlar / bildirim flyout'larının süreçleri başlar başlamaz sonlandırılır, stok görev çubuğu göründüğü anda gizlenir (`--keep-stock` kapatır). `Win`+`S` / `Win`+`Q` Aether'in Başlat aramasını açar; `Win`+`Shift`+`S` gibi `Shift` / `Ctrl` / `Alt` kombinasyonları Windows'ta kalır.
 - **Masaüstü**: duvar kağıdı (doldur / sığdır / uzat / ortala / döşe, yumuşak geçiş) ve simgeler Aether cam stilinde; seçim, sürükle-bırak, yeniden adlandırma, kopyala/kes/yapıştır, gerçek Windows bağlam menüsü ("Diğer seçenekler"), `Ctrl` + tekerlek ile simge boyutu, `Win` + `D`.
 - **Özelleştir** (masaüstüne sağ tık): canlı önizleme, duvar kağıdı ve slayt gösterisi, karartma, bulanıklık, simge boyutu, etiketler, parlama, vurgu rengi, saat. Widget'ların üstünde, kendi pencerelerinde açılır.
 - **Widget'lar**: sistem performansı, ağ, saat, depolama, hava durumu, çalan müzik. Sağ tıkla gizlenir (tek tek veya hepsi).
@@ -56,6 +57,7 @@ cmake --build build --config Release
 | `%APPDATA%\Aether\theme.txt`, `lang.txt` | Tüm programların paylaştığı tema ve dil |
 | `%APPDATA%\Aether\desktop.cfg` | Masaüstü görünümü ve simge konumları |
 | `%APPDATA%\Aether\shell-backup.json` | Önceki Windows kabuğu (kaldırma için) |
+| `%APPDATA%\Aether\shell-policy.txt` | "Hızlı Ayarlar'ı kaldır" politikasının önceki değeri (yalnızca kabuk modu) |
 | `%APPDATA%\Aether\no-intro`, `use-explorer` | İsteğe bağlı anahtar dosyaları |
 
 ## Lisans

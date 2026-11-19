@@ -248,6 +248,47 @@ void RestoreWallpaper(const std::wstring& installDir) {
 
 std::wstring ShellBackupPath() { const std::wstring a = Env(L"APPDATA"); return a.empty() ? L"" : a + L"\\Aether\\shell-backup.json"; }
 constexpr wchar_t kWinlogon[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
+
+// With Aether as the shell, Windows' own Quick Settings flyout (volume / network / brightness ...) is switched off by the documented
+// "Remove Quick Settings" user policy: Aether has its own. Only this user is affected. The value that was there before is written to
+// %APPDATA%\Aether\shell-policy.txt first and put back when Aether is no longer the shell / is uninstalled.
+// (The notification-centre policy is left alone on purpose: with it Windows stops collecting the notifications Aether shows.)
+constexpr wchar_t kPolicyExplorer[] = L"Software\\Policies\\Microsoft\\Windows\\Explorer";
+constexpr wchar_t kPolicyQuickSettings[] = L"DisableControlCenter";
+std::wstring PolicyMarkerPath() { const std::wstring a = Env(L"APPDATA"); return a.empty() ? L"" : a + L"\\Aether\\shell-policy.txt"; }
+
+void ApplyShellPolicies() {
+    const std::wstring mk = PolicyMarkerPath();
+    if (mk.empty()) return;
+    bool created = false;
+    if (!Exists(mk)) {                                                     // remember the user's own setting, once
+        created = true;
+        DWORD v = 0, n = sizeof(v);
+        const bool had = RegGetValueW(HKEY_CURRENT_USER, kPolicyExplorer, kPolicyQuickSettings, RRF_RT_REG_DWORD, nullptr, &v, &n) == ERROR_SUCCESS;
+        const std::string s = had ? std::to_string(v) : std::string("absent");
+        HANDLE h = CreateFileW(mk.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return;                              // no backup, no change
+        DWORD w = 0; WriteFile(h, s.data(), static_cast<DWORD>(s.size()), &w, nullptr); CloseHandle(h);
+    }
+    // HKCU\Software\Policies is writable by administrators only; the installer runs elevated. Without the right nothing was changed: no marker either.
+    if (!RegSetDword(HKEY_CURRENT_USER, kPolicyExplorer, kPolicyQuickSettings, 1) && created) DeleteFileW(mk.c_str());
+}
+
+void RestoreShellPolicies() {
+    const std::wstring mk = PolicyMarkerPath();
+    if (mk.empty() || !Exists(mk)) return;
+    char buf[32] = {}; DWORD n = 0;
+    HANDLE h = CreateFileW(mk.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    ReadFile(h, buf, sizeof(buf) - 1, &n, nullptr); CloseHandle(h);
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kPolicyExplorer, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+        if (n && buf[0] >= '0' && buf[0] <= '9') { const DWORD v = static_cast<DWORD>(strtoul(buf, nullptr, 10)); RegSetValueExW(k, kPolicyQuickSettings, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v)); }
+        else RegDeleteValueW(k, kPolicyQuickSettings);
+        RegCloseKey(k);
+    }
+    DeleteFileW(mk.c_str());
+}
 const wchar_t* const kFolderClasses[] = {L"Directory", L"Folder", L"Drive"};
 
 // An existing installation (HKCU uninstall entry + AetherShell.exe on disk): fills `o` with the options it was installed with,
@@ -368,7 +409,11 @@ void DoInstall(Opts o, Progress* pr) {
             if (h != INVALID_HANDLE_VALUE) { DWORD w = 0; WriteFile(h, js.data(), static_cast<DWORD>(js.size()), &w, nullptr); CloseHandle(h); }
         }
         RegSetStr(HKEY_CURRENT_USER, kWinlogon, L"Shell", L"\"" + shellExe + L"\"");
-    } else if (o.autostart) {
+        ApplyShellPolicies();
+    } else {
+        RestoreShellPolicies();                                      // an earlier install as the shell may have left the policy on
+    }
+    if (!o.replaceShell && o.autostart) {
         RegSetStr(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"Aether", L"\"" + shellExe + L"\"");
     }
     if ((o.replaceShell || o.folders) && o.expl) {
@@ -421,8 +466,9 @@ void DoUninstall(const std::wstring& dir, bool wipe, Progress* pr) {
         std::wstring v;
         if (RegGetStr(HKEY_CURRENT_USER, key + L"\\command", nullptr, v) && v.find(L"AetherExplorer") != std::wstring::npos) SHDeleteKeyW(HKEY_CURRENT_USER, key.c_str());
     }
+    RestoreShellPolicies();                                         // Quick Settings policy back to the user's own value
     RestoreStockTaskbar();                                          // the Windows taskbar exactly as it was (auto-hide etc.)
-    RestoreWallpaper(dir);                                          // the user's own wallpaper and fit mode
+    RestoreWallpaper(dir);                                         // the user's own wallpaper and fit mode
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     const std::wstring bk = ShellBackupPath(); if (!bk.empty()) DeleteFileW(bk.c_str());
     DeleteFileW((Env(L"APPDATA") + L"\\Aether\\use-explorer").c_str());

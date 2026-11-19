@@ -35,7 +35,7 @@ add_custom_command(TARGET Aether POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/assets/iconpacks $<TARGET_FILE_DIR:Aether>/iconpacks)
 
 # ---- Aether Bar: standalone taskbar replacement (separate exe, same rendering stack) ----------
-add_executable(AetherBar WIN32 bar/main.cpp bar/aether_bar.cpp bar/start_menu.cpp bar/tray_host.cpp bar/flyouts.cpp bar/weather.cpp bar/notifications.cpp bar/toast_host.cpp bar/wifi.cpp bar/panels.cpp bar/window_preview.cpp src/render/dcomp_layer.cpp src/render/context_menu.cpp assets/icons/aether.rc)
+add_executable(AetherBar WIN32 bar/main.cpp bar/aether_bar.cpp bar/start_menu.cpp bar/tray_host.cpp bar/flyouts.cpp bar/weather.cpp bar/notifications.cpp bar/toast_host.cpp bar/volume_osd.cpp bar/native_ui_guard.cpp bar/wifi.cpp bar/panels.cpp bar/window_preview.cpp src/render/dcomp_layer.cpp src/render/context_menu.cpp assets/icons/aether.rc)
 target_include_directories(AetherBar PRIVATE include third_party/json)
 target_link_libraries(AetherBar PRIVATE d3d11 dxgi d2d1 dwrite dcomp dwmapi shcore shell32 ole32 oleaut32 uuid powrprof advapi32 iphlpapi wlanapi ws2_32 winhttp secur32 windowscodecs shlwapi dxguid)
 if(MSVC)

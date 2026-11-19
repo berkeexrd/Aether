@@ -64,6 +64,15 @@ $curShell = (Get-ItemProperty $winlogon -ErrorAction SilentlyContinue).Shell
 if ($curShell -and $curShell -like '*Aether*') {
     if ($prev) { Set-ItemProperty -Path $winlogon -Name Shell -Value $prev } else { Remove-ItemProperty -Path $winlogon -Name Shell -ErrorAction SilentlyContinue }
 }
+# Quick Settings policy that Aether set while it was the shell: back to the user's own value
+$pol = Join-Path $appdata 'shell-policy.txt'
+if (Test-Path $pol) {
+    $pv = (Get-Content $pol -Raw).Trim()
+    $pk = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'
+    if ($pv -match '^\d+$') { Set-ItemProperty -Path $pk -Name DisableControlCenter -Value ([int]$pv) -Type DWord -ErrorAction SilentlyContinue }
+    else { Remove-ItemProperty -Path $pk -Name DisableControlCenter -ErrorAction SilentlyContinue }
+    Remove-Item $pol -Force -ErrorAction SilentlyContinue
+}
 foreach ($k in 'Directory','Folder','Drive') {
     $key = "HKCU:\Software\Classes\$k\shell\open"
     $cmd = (Get-ItemProperty "$key\command" -ErrorAction SilentlyContinue).'(default)'
@@ -128,7 +137,8 @@ if (-not $restored) {
 # 6. files, settings, shortcuts
 Say (T '6/7 Dosyalar, ayarlar ve kısayollar siliniyor...' '6/7 Deleting files, settings and shortcuts...')
 $programs = [Environment]::GetFolderPath('Programs'); $desktop = [Environment]::GetFolderPath('Desktop')
-$targets = @($installDirs) + @($appdata, (Join-Path $programs 'Aether'), (Join-Path $desktop 'Aether.lnk'), (Join-Path $env:TEMP 'aether_wpn'), (Join-Path $env:TEMP 'aether-uninstall.exe'), (Join-Path $env:TEMP 'aether-payload.zip'))
+$targets = @($installDirs) + @($appdata, (Join-Path $programs 'Aether'), (Join-Path $desktop 'Aether.lnk'), (Join-Path $env:TEMP 'aether_wpn'), (Join-Path $env:TEMP 'aether-uninstall.exe'), (Join-Path $env:TEMP 'aether-payload.zip'),
+    (Join-Path $env:LOCALAPPDATA 'AetherPromoBackup'), (Join-Path $env:TEMP 'AetherDemoDesktop'), (Join-Path $env:TEMP 'AetherDemo'))
 foreach ($t in $targets) { if ($t -and (Test-Path $t)) { Remove-Item $t -Recurse -Force -ErrorAction SilentlyContinue; if (Test-Path $t) { Say ((T 'Silinemedi: ' 'Could not delete: ') + $t) } } }
 
 # 7. explorer

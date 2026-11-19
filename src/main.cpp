@@ -209,21 +209,46 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             SendInput(1, &mv, sizeof(INPUT));
         };
         auto dismissMenu = [key]() {   // Esc is not enough for the desktop's own menu: also click on empty wallpaper well away from it
-            key(VK_ESCAPE, false); key(VK_ESCAPE, true);
+            // The menu polls the key / button state (GetAsyncKeyState), so a press that is over before its next poll goes unnoticed: hold it a little.
+            key(VK_ESCAPE, false); Sleep(120); key(VK_ESCAPE, true);
             const int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
             const int x = static_cast<int>(w * 0.25), y = static_cast<int>(h * 0.50);
             SetCursorPos(x, y);
-            INPUT in[3] = {}; in[0].type = in[1].type = in[2].type = INPUT_MOUSE;
-            in[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE; in[0].mi.dx = x * 65535 / std::max(1, w - 1); in[0].mi.dy = y * 65535 / std::max(1, h - 1);
-            in[1].mi.dwFlags = MOUSEEVENTF_LEFTDOWN; in[2].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-            SendInput(3, in, sizeof(INPUT));
+            INPUT mv{}; mv.type = INPUT_MOUSE; mv.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE; mv.mi.dx = x * 65535 / std::max(1, w - 1); mv.mi.dy = y * 65535 / std::max(1, h - 1);
+            SendInput(1, &mv, sizeof(INPUT));
+            INPUT dn{}; dn.type = INPUT_MOUSE; dn.mi.dwFlags = MOUSEEVENTF_LEFTDOWN; SendInput(1, &dn, sizeof(INPUT));
+            Sleep(120);
+            INPUT up{}; up.type = INPUT_MOUSE; up.mi.dwFlags = MOUSEEVENTF_LEFTUP; SendInput(1, &up, sizeof(INPUT));
         };
         auto rightClick = []() {
             INPUT in[2] = {}; in[0].type = in[1].type = INPUT_MOUSE;
             in[0].mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; in[1].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
             SendInput(2, in, sizeof(INPUT));
         };
-        auto mode = [&island](island::IslandMode md) { return [&island, md] { if (island) island->SetMode(md); }; };
+        // Pinned while a showcase scene shows an expanded state: without a mouse over the island it would collapse again after a split second.
+        auto mode = [&island](island::IslandMode md) { return [&island, md] { if (island) { island->SetPinned(md != island::IslandMode::Idle); island->SetMode(md); } }; };
+        // ---- promo-video helpers (the tour is also what tools\record_promo.ps1 films) -------------------------------------------------
+        auto demoFlyout = [](int id) {   // every bar gets it (one per monitor); only the primary one answers
+            return [id] { for (HWND b = nullptr; (b = FindWindowExW(nullptr, b, L"AetherBarClass", nullptr)) != nullptr;) PostMessageW(b, WM_APP + 30 /*AetherBar::kMsgDemoFlyout*/, static_cast<WPARAM>(id), 0); };
+        };
+        auto focusWindow = [](const wchar_t* cls) {
+            HWND h = FindWindowW(cls, nullptr);
+            if (!h) return;
+            if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+            const DWORD fg = GetWindowThreadProcessId(GetForegroundWindow(), nullptr), me = GetCurrentThreadId();
+            if (fg && fg != me) AttachThreadInput(me, fg, TRUE);
+            BringWindowToTop(h); SetForegroundWindow(h);
+            if (fg && fg != me) AttachThreadInput(me, fg, FALSE);
+        };
+        auto typeText = [](const wchar_t* s) {
+            for (; *s; ++s) {
+                INPUT in[2] = {}; in[0].type = in[1].type = INPUT_KEYBOARD;
+                in[0].ki.wScan = in[1].ki.wScan = *s; in[0].ki.dwFlags = KEYEVENTF_UNICODE; in[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+                SendInput(2, in, sizeof(INPUT));
+            }
+        };
+        auto chord = [key](WORD mod, WORD vk) { key(mod, false); key(vk, false); key(vk, true); key(mod, true); };
+        auto shellCtl = []() { return FindWindowExW(HWND_MESSAGE, nullptr, L"AetherShellControl", nullptr); };
         tour.push_back({4.0, false, nullptr, nullptr});                                                      // start-up: island drops in, cards rise
         tour.push_back({3.0, false, mode(island::IslandMode::MediaExpanded), nullptr});
         tour.push_back({3.0, false, mode(island::IslandMode::SystemExpanded), nullptr});
@@ -231,10 +256,56 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         tour.push_back({3.4, false, [&island] {
             island::NotificationData nd; nd.title = L"Aether"; nd.message = L"Notifications pop out of the island"; nd.sourceApp = L"Aether"; nd.timeRemaining = 3.0;
             if (island) island->PushNotification(nd); }, nullptr});
-        tour.push_back({3.6, true, moveToWallpaper, [=] { tap(VK_ESCAPE); }, [=] { key(VK_LWIN, false); key(VK_LWIN, true); }, 0.6});   // Start menu (the bar hooks the Windows key)
+        tour.push_back({2.6, true, demoFlyout(1), demoFlyout(0)});                                                   // quick settings
+        tour.push_back({2.6, true, demoFlyout(2), demoFlyout(0)});                                                   // calendar
+        tour.push_back({2.4, true, demoFlyout(3), demoFlyout(0)});                                                   // tray
+        tour.push_back({2.6, true, demoFlyout(4), demoFlyout(0)});                                                   // weather
+        tour.push_back({1.7, true, moveToWallpaper, nullptr, demoFlyout(6), 0.5});   // Start menu (opened by message: an injected Windows key would open Windows' own Start)
+        { const wchar_t* q = L"settings"; for (const wchar_t* c = q; *c; ++c) { const wchar_t ch = *c; tour.push_back({0.16, true, [ch] { if (HWND s = FindWindowW(L"AetherStartMenuClass", nullptr)) PostMessageW(s, WM_CHAR, ch, 0); }, nullptr}); } }   // typed straight into the Start menu's search box
+        tour.push_back({1.5, true, nullptr, demoFlyout(7)});
         tour.push_back({3.6, true, moveToWallpaper, dismissMenu, rightClick, 0.8});
         tour.push_back({0.9, true, nullptr, nullptr});                                                              // let the menu fade out before the next scene                                          // desktop context menu
-        tour.push_back({5.5, true, [=] { launch(L"AetherExplorer.exe"); }, [=] { closeWindow(L"AetherExplorerWindow"); }});
+        // Settings Center: every main page for a moment
+        {
+            const ui::SettingsTab tabs[] = {ui::SettingsTab::General, ui::SettingsTab::DynamicIsland, ui::SettingsTab::Widgets, ui::SettingsTab::Taskbar, ui::SettingsTab::Desktop, ui::SettingsTab::Appearance};
+            for (size_t i = 0; i < std::size(tabs); ++i) {
+                const ui::SettingsTab tb = tabs[i];
+                std::function<void()> endFn;
+                if (i + 1 == std::size(tabs)) endFn = [] { ui::SettingsWindow::Instance().Show(false); };
+                tour.push_back({i == 0 ? 2.2 : 1.7, true, [tb] { ui::SettingsWindow::Instance().ShowTab(tb); }, endFn});
+            }
+        }
+        // Run box (Win+R), typed letter by letter
+        tour.push_back({1.0, true, [=] { if (HWND c = shellCtl()) PostMessageW(c, WM_APP + 6 /*shellkeys::kMsgRun*/, 0, 0); }, nullptr});
+        { const wchar_t* q = L"notepad"; for (const wchar_t* c = q; *c; ++c) { const wchar_t one[2] = {*c, 0}; std::wstring s1 = one; tour.push_back({0.17, true, [=] { typeText(s1.c_str()); }, nullptr}); } }
+        tour.push_back({1.1, true, nullptr, [=] { tap(VK_ESCAPE); }});
+        // Explorer: thumbnails, grid, tabs and a big copy with the progress card
+        {
+            wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
+            const std::wstring base = std::wstring(tmp) + L"AetherDemo", src = base + L"\\Wallpapers", dst = base + L"\\Backup";
+            tour.push_back({2.6, true, [=] {
+                CreateDirectoryW(base.c_str(), nullptr); CreateDirectoryW(src.c_str(), nullptr); CreateDirectoryW(dst.c_str(), nullptr);
+                WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW((exeDir + L"\\wallpapers\\*.jpg").c_str(), &fd);
+                if (h != INVALID_HANDLE_VALUE) { do CopyFileW((exeDir + L"\\wallpapers\\" + fd.cFileName).c_str(), (src + L"\\" + fd.cFileName).c_str(), FALSE); while (FindNextFileW(h, &fd)); FindClose(h); }
+                HANDLE big = CreateFileW((src + L"\\Project Aether (raw footage).mov").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (big != INVALID_HANDLE_VALUE) { LARGE_INTEGER sz; sz.QuadPart = 3LL * 1024 * 1024 * 1024; SetFilePointerEx(big, sz, nullptr, FILE_BEGIN); SetEndOfFile(big); CloseHandle(big); }
+                std::wstring cl = L"\"" + exeDir + L"\\AetherExplorer.exe\" \"" + src + L"\"";
+                STARTUPINFOW si{sizeof(si)}; PROCESS_INFORMATION pi{};
+                if (CreateProcessW(nullptr, cl.data(), nullptr, nullptr, FALSE, 0, nullptr, exeDir.c_str(), &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+            }, nullptr});
+            tour.push_back({2.0, true, [=] { focusWindow(L"AetherExplorerWindow"); chord(VK_CONTROL, '2'); }, nullptr});          // grid with thumbnails
+            tour.push_back({1.6, true, [=] { chord(VK_CONTROL, '1'); }, nullptr});                                               // back to the list
+            tour.push_back({1.4, true, [=] { chord(VK_CONTROL, 'A'); }, nullptr});                                               // select everything
+            tour.push_back({0.6, true, [=] { chord(VK_CONTROL, 'C'); chord(VK_CONTROL, 'T'); }, nullptr});                       // copy, new tab
+            tour.push_back({0.5, true, [=] { chord(VK_CONTROL, 'L'); }, nullptr});
+            tour.push_back({0.9, true, [=] { typeText(dst.c_str()); tap(VK_RETURN); }, nullptr});                                // ... in the Backup folder
+            tour.push_back({6.5, true, [=] { chord(VK_CONTROL, 'V'); }, nullptr});                                               // paste: progress card
+            tour.push_back({0.8, true, nullptr, [=] { closeWindow(L"AetherExplorerWindow"); }});
+            tour.push_back({0.6, true, [=] {
+                std::wstring from = base + L"\\"; from.push_back(0); from.push_back(0);
+                SHFILEOPSTRUCTW op{}; op.wFunc = FO_DELETE; op.pFrom = from.c_str(); op.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+                SHFileOperationW(&op); }, nullptr});
+        }
         tour.push_back({4.0, true, [=] { launch(L"AetherBin.exe"); }, [=] { closeWindow(L"AetherBinWindow"); }});
         int themeCount = 0; render::glass::Themes(&themeCount);
         for (int i = 0; i < themeCount; ++i)                                                                       // every colour theme, to finish
@@ -244,6 +315,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         tour.push_back({1.5, true, [=] {                                                                           // back to the user's own look
             render::glass::SetTheme(origTheme); render::glass::SaveThemeFile(origTheme);
             if (!origWall.empty()) aether::system::wallpaper::SetFile(origWall); }, nullptr});
+        // AETHER_TOUR=extra (tools\record_promo.ps1 -Tour extra): only the island and the bar's flyouts, for a second pass of the promo footage
+        wchar_t tourName[32] = {};
+        if (GetEnvironmentVariableW(L"AETHER_TOUR", tourName, 32) && !wcscmp(tourName, L"extra")) {
+            tour.clear();
+            tour.push_back({1.2, false, nullptr, nullptr});
+            tour.push_back({3.2, false, mode(island::IslandMode::MediaExpanded), nullptr});
+            tour.push_back({3.2, false, mode(island::IslandMode::SystemExpanded), nullptr});
+            tour.push_back({1.6, false, mode(island::IslandMode::Idle), nullptr});
+            tour.push_back({3.0, true, demoFlyout(1), demoFlyout(0)});    // quick settings
+            tour.push_back({3.0, true, demoFlyout(2), demoFlyout(0)});    // calendar
+            tour.push_back({2.6, true, demoFlyout(3), demoFlyout(0)});    // tray
+            tour.push_back({3.0, true, demoFlyout(4), demoFlyout(0)});    // weather
+            tour.push_back({1.0, true, nullptr, nullptr});
+        }
     }
     float frameDur = 0.0f;
     double lastMetricsTick = 0.0;

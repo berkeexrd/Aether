@@ -25,3 +25,27 @@ _review/
 dist/
 # Dear ImGui is downloaded by CMake (or copied here by hand)
 third_party/imgui/
+
+# build leftovers from other tools / IDEs
+build*/
+cmake-build-*/
+x64/
+Debug/
+Release/
+*.pdb
+*.obj
+*.ilk
+*.exp
+*.user
+*.suo
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+# recording / promo material and machine-specific helper scripts (they contain local paths and personal files)
+frames/
+*.ffconcat
+*.mp3
+*.wav
+tools/record_promo*
+tools/aether-clean-admin.bat

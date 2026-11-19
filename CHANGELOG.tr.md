@@ -2,6 +2,15 @@
 
 ## [Yayınlanmadı]
 
+### Windows'un kendi kabuk yüzeyleri yerine Aether
+- **Ses göstergesi**: ses veya sessiz durumu değişince (tuşlar, karıştırıcı, herhangi bir uygulama, çubuğun tekerleği) çubuğun üstünde hoparlör simgesi, seviye çubuğu ve yüzdeyle cam bir hap kayarak gelir. Ses tuşlarını artık AetherBar kendisi işler (%2 adım, sessize alma), böylece Windows'un kendi ses penceresi yanında görünmez. Varsayılan çalma aygıtı değişince onu izler.
+- **Windows'un kendi arayüzü uzak durur**: çubuk çalışırken Windows'un Başlat, Arama, Widget'lar / Başlat akışı ve hızlı ayarlar / takvim / bildirim flyout'larının ana süreçleri Windows başlatır başlatmaz sonlandırılır (Aether kapanınca Windows yeniden başlatır; `--keep-stock` bunu kapatır). `Win`+`S` / `Win`+`Q` Aether'in Başlat'ını (aramayı) açar; `Win`+`W`, `Win`+`A`, `Win`+`N` Windows flyout'u açmak yerine bir şey yapmaz. `Shift` / `Ctrl` / `Alt` ile kombinasyonlar (ör. `Win`+`Shift`+`S` ekran kesme) Windows'a bırakılır.
+- **Kabuk modu politikası**: Aether kabuk olarak kurulunca kurulum kullanıcıya özel "Hızlı Ayarlar'ı kaldır" politikasını (`DisableControlCenter`) da açar. Önceki değer `%APPDATA%\Aether\shell-policy.txt` dosyasında saklanır; kaldırıcı, temizleme betiği ve Aether artık kabuk olmayınca geri konur. Bildirim merkezi politikasına dokunulmaz (Aether Windows'un bildirimlerini okur). Yönetici hakkıyla çalışan kurulumu ister; `tools\install-shell.ps1` aynısını yönetici PowerShell'inden yapar.
+
+### Düzeltilenler
+- **Windows görev çubuğunun alttan çıkıp durması**: Aether her dakika tüm pencerelere `TaskbarCreated` yayınını yeniden gönderiyordu ve Explorer'ın kendi (gizli) görev çubuğu kendini yeniden göstererek karşılık veriyordu. Yeniden yayın artık Explorer'ı atlar; stok görev çubuğu 100 ms'lik yoklama yerine, göründüğü anda bir pencere olayı kancasıyla gizlenir.
+- **Aether'den sonra açılan Wallpaper Engine ana monitörde fark edilmiyordu**: canlı duvar kağıdı denetimi tüm masaüstlerinin paylaştığı tek bir sayaç kullanıyordu, bu yüzden biri hiç çalışmıyordu. Her masaüstünün kendi sayacı var; algılama yalnızca işlem adına bakar; temanın duvar kağıdını yeniden seçmek, Windows'ta zaten o resim varsa Wallpaper Engine'i de yeniler.
+
 ### Aether'in kendi bildirim sistemi, sürükleyerek sabitleme, Wallpaper Engine, widget boyutları
 - **Aether'in çizdiği bildirimler**: Windows bildirimleri artık sağ üst veya sağ alt köşeden kayarak gelen Aether cam kartları olarak görünür. Kartlar üst üste dizilir (en fazla dört), üstüne gelince durur, uygulama simgesini gösterir, tıklayınca uygulamayı açar, kapatma düğmesi veya sağ tıkla kapanır. Bu açıkken Windows'un kendi bildirim pencereleri ekran dışına taşınır; geçmiş bildirim merkezinde kalır.
 - Oyun, tam ekran video veya sunum sırasında ve Rahatsız etme açıkken bildirimler sessiz kalır.

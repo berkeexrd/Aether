@@ -14,6 +14,8 @@
 #include "aether/bar/panels.hpp"
 #include "aether/bar/tray_host.hpp"
 #include "aether/bar/toast_host.hpp"
+#include "aether/bar/volume_osd.hpp"
+#include "aether/bar/native_ui_guard.hpp"
 #include "aether/bar/notifications.hpp"
 #include "aether/bar/weather.hpp"
 #include "aether/core/i18n.hpp"
@@ -31,6 +33,7 @@ namespace {
 constexpr UINT kMsgToggleStart = WM_APP + 1;   // Win key tapped
 constexpr UINT kMsgRebuild     = WM_APP + 2;   // monitors / DPI changed
 constexpr UINT kMsgReapplyHide = WM_APP + 3;   // Explorer restarted
+constexpr UINT kMsgVolume      = WM_APP + 4;   // volume key: wParam 1 up, 2 down, 3 mute
 
 DWORD g_mainThread = 0;
 HHOOK g_hook = nullptr;                 // owned by the hook thread
@@ -86,6 +89,12 @@ LRESULT CALLBACK KeyboardHook(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION) {
         const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
         if (aether::shellkeys::Route(k, wp, PostToShell, ElevatedForeground)) return 1;
+        // Volume keys are handled here (Aether's volume pop-up), so Explorer never sees them and Windows' own volume flyout never shows.
+        if (k->vkCode == VK_VOLUME_UP || k->vkCode == VK_VOLUME_DOWN || k->vkCode == VK_VOLUME_MUTE) {
+            if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)
+                PostThreadMessageW(g_mainThread, kMsgVolume, k->vkCode == VK_VOLUME_UP ? 1 : (k->vkCode == VK_VOLUME_DOWN ? 2 : 3), 0);
+            return 1;
+        }
         if (!(k->flags & LLKHF_INJECTED)) {
             const bool isWin = (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN);
             const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
@@ -104,6 +113,19 @@ LRESULT CALLBACK KeyboardHook(int code, WPARAM wp, LPARAM lp) {
                 }
             } else if (down && g_winDown) {
                 g_combo = true;
+                // Windows' own Search / Widgets / quick settings / notification centre are not used: Win+S and Win+Q open Aether's Start
+                // (its search), the others do nothing instead of opening a Windows flyout over the bar.
+                // only the plain combination: Win+Shift+S (screen snip), Win+Ctrl+... etc. still belong to Windows
+                const bool mods = (GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_MENU)) & 0x8000;
+                if (!mods && (k->vkCode == 'S' || k->vkCode == 'Q')) {
+                    aether::shellkeys::MaskKeys();
+                    PostThreadMessageW(g_mainThread, kMsgToggleStart, 0, 0);
+                    return 1;
+                }
+                if (!mods && (k->vkCode == 'W' || k->vkCode == 'A' || k->vkCode == 'N')) {
+                    aether::shellkeys::MaskKeys();
+                    return 1;
+                }
             }
         }
     }
@@ -160,6 +182,8 @@ public:
         NotificationFeed::Instance().StartWatching();
         NativeToastHider::Enable(aether::system::notifycfg::Load().enabled);
         NativeToastHider::Start();
+        m_volume.Create();                                  // Aether's own volume pop-up
+        if (m_hard) NativeUiGuard::Start();                 // Windows' Start / Search / Widgets / flyout hosts never stay alive
         ShellTaskbarGuard::Instance().Hide(m_hard);
         Rebuild();
         return !m_bars.empty();
@@ -183,8 +207,10 @@ public:
     }
 
     void Shutdown() {
+        NativeUiGuard::Stop();
         NativeToastHider::Stop();
         NotificationFeed::Instance().StopWatching();
+        m_volume.Shutdown();
         m_toast.Shutdown();
         WeatherService::Instance().Stop();
         TrayHost::Instance().Destroy();   // hands the icons back to Explorer
@@ -213,6 +239,7 @@ public:
         animating |= m_weatherPanel.Frame(dt);
         animating |= m_net.Frame(dt);
         animating |= m_toast.Frame(dt);
+        animating |= m_volume.Frame(dt);
         m_pruneTimer += dt;
         if (m_pruneTimer >= 3.0f) { m_pruneTimer = 0.0f; TrayHost::Instance().Prune(); }
         return animating || m_rebuildAt.has_value();
@@ -230,6 +257,7 @@ private:
     WeatherPanel m_weatherPanel;
     NetPanel m_net;
     ToastHost m_toast;
+    VolumeOsd m_volume;
     float m_pruneTimer{0.0f};
     std::vector<std::unique_ptr<AetherBar>> m_bars;
     std::optional<std::chrono::steady_clock::time_point> m_rebuildAt;
@@ -297,6 +325,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
                     if (msg.message == kMsgToggleStart) { manager.ToggleStart(); continue; }
                     if (msg.message == kMsgRebuild)     { manager.ScheduleRebuild(); continue; }
                     if (msg.message == kMsgReapplyHide) { manager.ReapplyHide(); continue; }
+                    if (msg.message == kMsgVolume)      { VolumeOsd::Nudge(msg.wParam == 1 ? 1 : (msg.wParam == 2 ? -1 : 0)); continue; }
                 }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);

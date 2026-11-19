@@ -9,6 +9,8 @@
 #include <wrl/client.h>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <oleauto.h>
 #include <cstdlib>
 #include <cwchar>
 #include <thread>
@@ -104,9 +106,12 @@ private:
         j.px.resize(static_cast<size_t>(m_w) * m_h * 4);
         memcpy(j.px.data(), bgra, j.px.size());
         for (size_t i = 3; i < j.px.size(); i += 4) j.px[i] = 255;   // BitBlt leaves alpha at 0
-        if (!m_worker.joinable()) m_worker = std::thread([this] { Work(); });
+        if (m_workers.empty()) {                                   // several encoders: a 1080p PNG takes ~150 ms, one thread could not keep up with 60 fps
+            const unsigned n = std::max(2u, std::min(6u, std::thread::hardware_concurrency() / 2));
+            for (unsigned i = 0; i < n; ++i) m_workers.emplace_back([this] { Work(); });
+        }
         std::unique_lock<std::mutex> l(m_mx);
-        m_cv.wait(l, [&] { return m_q.size() < 6; });   // bounded: never more than a few frames of memory
+        m_cv.wait(l, [&] { return m_q.size() < 16; });   // bounded: never more than a few frames of memory
         m_q.push_back(std::move(j));
         m_cv.notify_all();
     }
@@ -123,6 +128,7 @@ private:
                 j = std::move(m_q.front()); m_q.pop_front();
                 m_cv.notify_all();
             }
+            if (!wic) CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));   // never drop a frame because the factory was not ready yet
             if (wic) Encode(wic.Get(), j);
         }
         CoUninitialize();
@@ -132,7 +138,13 @@ private:
         ComPtr<IWICBitmapEncoder> enc; ComPtr<IWICStream> st; ComPtr<IWICBitmapFrameEncode> fr; ComPtr<IPropertyBag2> pb;
         if (FAILED(wic->CreateStream(&st)) || FAILED(st->InitializeFromFilename(j.name.c_str(), GENERIC_WRITE))) return;
         if (FAILED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) || FAILED(enc->Initialize(st.Get(), WICBitmapEncoderNoCache))) return;
-        if (FAILED(enc->CreateNewFrame(&fr, &pb)) || FAILED(fr->Initialize(pb.Get()))) return;
+        if (FAILED(enc->CreateNewFrame(&fr, &pb))) return;
+        if (pb) {                                                      // no PNG filtering: about three times faster, the file a bit bigger
+            PROPBAG2 opt = {}; opt.pstrName = const_cast<LPOLESTR>(L"FilterOption");
+            VARIANT v; VariantInit(&v); v.vt = VT_UI1; v.bVal = WICPngFilterNone;
+            pb->Write(1, &opt, &v);
+        }
+        if (FAILED(fr->Initialize(pb.Get()))) return;
         fr->SetSize(static_cast<UINT>(m_w), static_cast<UINT>(m_h));
         WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
         fr->SetPixelFormat(&fmt);
@@ -151,12 +163,12 @@ public:
         }
         { std::lock_guard<std::mutex> l(m_mx); m_stop = true; }
         m_cv.notify_all();
-        if (m_worker.joinable()) m_worker.join();
+        for (auto& w : m_workers) if (w.joinable()) w.join();
     }
     ~FrameRecorder() { Finish(); }
 
 private:
-    std::thread m_worker; std::mutex m_mx; std::condition_variable m_cv; std::deque<Job> m_q; bool m_stop{false};
+    std::vector<std::thread> m_workers; std::mutex m_mx; std::condition_variable m_cv; std::deque<Job> m_q; bool m_stop{false};
     RecordOptions m_o;
     Microsoft::WRL::ComPtr<IWICImagingFactory> m_wic;
     int m_x{0}, m_y{0}, m_w{0}, m_h{0}, m_frame{0}, m_total{0};

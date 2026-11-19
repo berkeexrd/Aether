@@ -48,7 +48,18 @@ bool TrayHost::Create() {
 
 void TrayHost::Rebroadcast() {
     if (!m_hwnd) return;
-    PostMessageW(HWND_BROADCAST, RegisterWindowMessageW(L"TaskbarCreated"), 0, 0);
+    // Not to Explorer itself: its own taskbar answered every "TaskbarCreated" by showing itself again, which is what made the hidden Windows
+    // taskbar flash up from the bottom once a minute. Everything else still gets it.
+    DWORD shellPid = 0;
+    if (HWND sh = GetShellWindow()) GetWindowThreadProcessId(sh, &shellPid);
+    struct Ctx { UINT msg; DWORD shellPid; } c{RegisterWindowMessageW(L"TaskbarCreated"), shellPid};
+    EnumWindows([](HWND h, LPARAM l) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(l);
+        DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+        if (pid && (pid == c->shellPid || pid == GetCurrentProcessId())) return TRUE;
+        PostMessageW(h, c->msg, 0, 0);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&c));
     ++m_stage;
     // 1.5 s, +3.5 s, +10 s, +20 s after start, then every 60 s for good measure (cheap: apps that already have their icon just update it)
     static const UINT kDelays[] = {3500, 10000, 20000};

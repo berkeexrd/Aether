@@ -5,6 +5,15 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), versions follow
 
 ## [Unreleased]
 
+### Aether instead of Windows' own shell surfaces
+- **Volume pop-up**: a glass pill with speaker icon, level bar and percentage slides up above the bar whenever the volume or mute state changes (keys, mixer, any app, the bar's wheel). The volume keys are now handled by AetherBar itself (2 % steps, mute toggle), so Windows' own volume flyout no longer shows next to it. Follows the default playback device when it changes.
+- **Windows' own UI stays away**: while the bar runs, the host processes of Windows' Start, Search, Widgets / Start feed and the quick settings / calendar / notification flyouts are ended the moment Windows starts them (Windows starts them again after Aether is closed; `--keep-stock` turns this off). `Win`+`S` / `Win`+`Q` open Aether's Start (search); `Win`+`W`, `Win`+`A`, `Win`+`N` do nothing instead of opening a Windows flyout. Combinations with `Shift` / `Ctrl` / `Alt` (e.g. `Win`+`Shift`+`S`, the screen snip) are left to Windows.
+- **Shell mode policy**: when Aether is installed as the shell, the setup also turns on the per-user "Remove Quick Settings" policy (`DisableControlCenter`). The previous value is kept in `%APPDATA%\Aether\shell-policy.txt` and put back by the uninstaller, the clean-up script and when Aether is no longer the shell. The notification-centre policy is not touched (Aether reads Windows' notifications). Needs the elevated installer; `tools\install-shell.ps1` does the same from an administrator PowerShell.
+
+### Fixed
+- **Windows taskbar flashing up from the bottom**: Aether re-sent the `TaskbarCreated` broadcast to every window once a minute, and Explorer's own (hidden) taskbar answered by showing itself again. The re-broadcast skips Explorer now, and the stock taskbar is hidden by a window-event hook the moment it appears instead of by a 100 ms poll.
+- **Wallpaper Engine started after Aether was not noticed on the main monitor**: the live-wallpaper check used one counter shared by all desktops, so one of them never ran it. Each desktop has its own counter; detection now only needs the process name; choosing the theme's wallpaper again also refreshes Wallpaper Engine when Windows already had that picture.
+
 ### Own notification system, pinning by drag & drop, Wallpaper Engine, widget sizes
 - **Notifications drawn by Aether**: Windows notifications now appear as Aether glass cards sliding in from the top-right or bottom-right corner. Cards stack (up to four), pause while hovered, show the app icon, open the app on click and close with the close button or a right click. Windows' own banners are moved off screen while this is on; the notification centre keeps the history.
 - Notifications stay quiet while a game, a full-screen video or a presentation is running, and during Do not disturb.

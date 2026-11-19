@@ -27,6 +27,22 @@ if (-not (Test-Path $backup)) {
 if (-not (Test-Path $winlogon)) { New-Item $winlogon -Force | Out-Null }
 Set-ItemProperty -Path $winlogon -Name Shell -Value ('"' + $BinDir + '\AetherShell.exe"')
 
+# Windows' own Quick Settings flyout off ("Remove Quick Settings" user policy; Aether has its own). The old value is kept for uninstall-shell.ps1.
+$pol = Join-Path $dir 'shell-policy.txt'
+$pk = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'
+# (HKCU\Software\Policies can only be written from an administrator PowerShell; otherwise this step is skipped.)
+try {
+    $fresh = -not (Test-Path $pol)
+    if ($fresh) {
+        $old = (Get-ItemProperty $pk -ErrorAction SilentlyContinue).DisableControlCenter
+        Set-Content $pol -Value $(if ($null -ne $old) { "$old" } else { 'absent' }) -Encoding ASCII
+    }
+    try {
+        if (-not (Test-Path $pk)) { New-Item $pk -Force -ErrorAction Stop | Out-Null }
+        Set-ItemProperty -Path $pk -Name DisableControlCenter -Value 1 -Type DWord -ErrorAction Stop
+    } catch { if ($fresh) { Remove-Item $pol -Force -ErrorAction SilentlyContinue }; Write-Host 'Not changed: the Quick Settings policy needs an administrator PowerShell.' }
+} catch {}
+
 # 3) klasörler / sürücüler Aether Explorer'da açılsın
 $cmd = '"' + $BinDir + '\AetherExplorer.exe" "%1"'
 foreach ($k in 'Directory','Folder','Drive') {

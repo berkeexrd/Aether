@@ -15,6 +15,7 @@
 #include "aether/system/app_identity.hpp"
 #include "aether/system/icon_pack.hpp"
 #include "aether/system/bar_pin_msg.hpp"
+#include <atomic>
 #include <map>
 #include <unordered_map>
 #include <winsock2.h>
@@ -297,6 +298,48 @@ static void WriteSavedTaskbarState(UINT v) {
     if (FILE* fp = _wfopen(f.c_str(), L"wt")) { fprintf(fp, "%u\n", v); fclose(fp); }
 }
 
+// Explorer shows its taskbar again every now and then (a periodic refresh about once a minute, auto-hide reveals, a display change). Polling
+// only hid it again a tenth of a second later, so it flashed up from the bottom over our bar. This hook hides it the moment it appears.
+namespace {
+std::atomic<bool> g_stockHide{false};
+HANDLE g_stockThread{nullptr};
+DWORD g_stockTid{0};
+
+bool IsStockBarWnd(HWND h) {
+    wchar_t cls[40] = {};
+    if (!GetClassNameW(h, cls, 40)) return false;
+    if (wcscmp(cls, L"Shell_TrayWnd") != 0 && wcscmp(cls, L"Shell_SecondaryTrayWnd") != 0) return false;
+    DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+    return pid != GetCurrentProcessId();                    // our own TrayHost also owns a "Shell_TrayWnd"
+}
+
+void CALLBACK StockBarEvent(HWINEVENTHOOK, DWORD, HWND h, LONG idObject, LONG idChild, DWORD, DWORD) {
+    if (!g_stockHide || !h || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    if (IsWindowVisible(h) && IsStockBarWnd(h))     // asynchronous: Explorer's thread may be busy showing it, and this one must not wait for it
+        SetWindowPos(h, nullptr, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+}
+
+DWORD WINAPI StockBarThread(LPVOID) {
+    MSG msg; PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    const DWORD events[3] = {0x8002 /*EVENT_OBJECT_SHOW*/, 0x8018 /*EVENT_OBJECT_UNCLOAKED*/, 0x800B /*EVENT_OBJECT_LOCATIONCHANGE*/};
+    HWINEVENTHOOK hooks[3] = {};
+    for (int i = 0; i < 3; ++i) hooks[i] = SetWinEventHook(events[i], events[i], nullptr, StockBarEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    for (HWINEVENTHOOK hk : hooks) if (hk) UnhookWinEvent(hk);
+    return 0;
+}
+
+void SetStockWatch(bool on) {
+    g_stockHide = on;
+    if (on && !g_stockThread) g_stockThread = CreateThread(nullptr, 0, StockBarThread, nullptr, 0, &g_stockTid);
+    else if (!on && g_stockThread) {
+        PostThreadMessageW(g_stockTid, WM_QUIT, 0, 0);
+        WaitForSingleObject(g_stockThread, 500);
+        CloseHandle(g_stockThread); g_stockThread = nullptr;
+    }
+}
+} // namespace
+
 void ShellTaskbarGuard::Hide(bool hard) {
     m_wanted = true; m_hard = hard;                  // remembered: when Explorer's taskbar does not exist yet KeepHidden() retries
     HWND tray = StockTray();
@@ -315,6 +358,7 @@ void ShellTaskbarGuard::Hide(bool hard) {
     SHAppBarMessage(ABM_SETSTATE, &abd);
     m_hard = hard;
     if (hard) ForEachShellBar([](HWND h) { ShowWindow(h, SW_HIDE); });
+    SetStockWatch(hard);
     m_hidden = true;
 }
 
@@ -346,6 +390,7 @@ bool ShellTaskbarGuard::KeepHidden() {
 }
 
 void ShellTaskbarGuard::Restore() {
+    SetStockWatch(false);                             // before showing it again, or the hook would hide it right back
     HWND tray = StockTray();
     if (tray) {
         APPBARDATA abd = {sizeof(abd)};
@@ -435,6 +480,7 @@ bool AetherBar::Create() {
     ChangeWindowMessageFilterEx(m_hwnd, shellkeys::kMsgActivate, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(m_hwnd, system::barpin::MsgHover(), MSGFLT_ALLOW, nullptr);   // items dragged in from the desktop
     ChangeWindowMessageFilterEx(m_hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(m_hwnd, kMsgDemoFlyout, MSGFLT_ALLOW, nullptr);
 
     m_dcomp = std::make_unique<render::DCompLayer>();
     if (!m_dcomp->Initialize(m_hwnd, m_windowW, m_windowH)) return false;
@@ -1759,6 +1805,22 @@ LRESULT AetherBar::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == shellkeys::kMsgActivate) {
         HWND target = reinterpret_cast<HWND>(wp);
         if (target && IsWindow(target)) ActivateWindow(target);
+        return 0;
+    }
+    if (msg == kMsgDemoFlyout) {
+        if (m_primary) {
+            for (Flyout* f : {m_quick, m_calendar, m_tray, m_notify, m_weather, m_net}) if (f && f->IsOpen()) f->Hide();
+            switch (wp) {
+                case 1: ToggleFlyout(m_quick, m_layout.quick); break;
+                case 2: ToggleFlyout(m_calendar, m_layout.clock); break;
+                case 3: ToggleFlyout(m_tray, m_layout.chevron); break;
+                case 4: ToggleFlyout(m_weather, m_layout.weather); break;
+                case 5: ToggleFlyout(m_notify, m_layout.bell); break;
+                case 6: if (m_start && !m_start->IsOpen()) m_start->Show(m_mon, m_reservedPx); break;   // Start menu (the injected Windows key would open Windows' own)
+                case 7: if (m_start && m_start->IsOpen()) m_start->Hide(); break;
+                default: break;
+            }
+        }
         return 0;
     }
     if (m_shellHookMsg && msg == m_shellHookMsg) {

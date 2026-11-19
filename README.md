@@ -41,6 +41,8 @@ Aether is a set of small programs that share one look. Use them next to Windows,
 - Custom **Start menu** with search, pinned and recent apps, user card and power menu.
 - Real **system tray host**, crisp icons at native size.
 - Own animated flyouts: quick settings, network centre (Wi-Fi with WPA2/WPA3), notification centre, weather ([Open-Meteo](https://open-meteo.com/)), calendar.
+- **Volume pop-up**: a glass pill slides up above the bar whenever the volume or mute state changes. The volume keys are handled by the bar itself, so Windows' own flyout does not appear next to it.
+- **Windows' own surfaces stay away**: while the bar runs, the host processes of Windows' Start, Search, Widgets and quick settings / notification flyouts are ended as soon as Windows starts them, and the stock taskbar is hidden the moment it appears (`--keep-stock` turns this off). `Win`+`S` / `Win`+`Q` open Aether's Start search; `Shift` / `Ctrl` / `Alt` combinations such as `Win`+`Shift`+`S` still belong to Windows.
 
 ### Desktop (AetherDesktop)
 - Draws the wallpaper (fill / fit / stretch / center / tile, cross-fade) and the desktop icons in the Aether glass style, directly above Windows' own desktop. Closing it simply uncovers Explorer's desktop again.
@@ -58,7 +60,7 @@ Draggable, grid-snapping cards: System performance, Network activity, Clock, Sto
 - Recycle Bin window: original folder, delete date, size; restore, delete for good, empty (through the shell's own recycle-bin folder).
 
 ### Shell mode (AetherShell)
-Aether can replace `explorer.exe` for a user (or for everybody). `AetherShell` starts and restarts the bar, desktop and island, runs the logon startup items (Run, RunOnce, Startup folders) and provides Alt+Tab, Win+Tab, Win+R, Win+M, Win+I, Win+D, Win+E. Escape hatches: hold **Shift** while signing in, or create `%APPDATA%\Aether\use-explorer`. Details: [tools/KABUK.md](tools/KABUK.md) (Turkish).
+Aether can replace `explorer.exe` for a user (or for everybody). `AetherShell` starts and restarts the bar, desktop and island, runs the logon startup items (Run, RunOnce, Startup folders) and provides Alt+Tab, Win+Tab, Win+R, Win+M, Win+I, Win+D, Win+E. As the shell it also turns on the per-user Remove Quick Settings policy (the previous value is restored on uninstall). Escape hatches: hold **Shift** while signing in, or create `%APPDATA%\Aether\use-explorer`. Details: [tools/KABUK.md](tools/KABUK.md) (Turkish).
 
 ### Intro and installer
 - `AetherIntro` is a short, calm logo animation (logo, wordmark, hairline progress bar) at logon; `--first` gives the longer welcome version. Click / Esc skips it. Create `%APPDATA%\Aether\no-intro` to disable it.
@@ -111,6 +113,8 @@ Manual shell installation without the installer: `tools\install-shell.bat` / `to
 | `Ctrl` + wheel on the desktop | Icon size |
 | `Win` + `D` / `Win` + `E` / `Win` + `R` | Show desktop / Explorer / Run (AetherShell, AetherDesktop) |
 | `Alt` + `Tab`, `Win` + `Tab` | Aether window switcher (AetherShell) |
+| `Win` + `S` / `Win` + `Q` | Aether Start with search (AetherBar) |
+| Volume keys | Change / mute the volume with Aether's pop-up (AetherBar) |
 
 ## Files Aether writes
 
@@ -120,6 +124,7 @@ Manual shell installation without the installer: `tools\install-shell.bat` / `to
 | `%APPDATA%\Aether\theme.txt`, `lang.txt` | Theme and language shared by every program |
 | `%APPDATA%\Aether\desktop.cfg` | Desktop look and icon positions |
 | `%APPDATA%\Aether\shell-backup.json` | The previous Windows shell (for uninstall) |
+| `%APPDATA%\Aether\shell-policy.txt` | The previous Remove Quick Settings policy value (shell mode only) |
 | `%APPDATA%\Aether\no-intro`, `use-explorer` | Optional switch files |
 
 ## Project layout

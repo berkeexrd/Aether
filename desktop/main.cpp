@@ -254,7 +254,8 @@ private:
 
     // wallpaper
     Wall m_wall, m_wallPrev; float m_wallFade{1.0f}; std::wstring m_wallKey;
-    bool m_liveWall{false};          // Wallpaper Engine is running: its live wallpaper lives behind this window, so ours must not cover it
+    int m_syncN{0};
+    bool m_liveWall{false};         // Wallpaper Engine is running: its live wallpaper lives behind this window, so ours must not cover it
     Color m_bgColor{0.05f, 0.03f, 0.10f, 1.0f};
     bool m_tracking{false};
     ULONGLONG m_born{GetTickCount64()}; int m_iconSeq{0}; bool m_firstWall{true};   // start-up reveal
@@ -529,6 +530,24 @@ bool Desktop::Create(HINSTANCE inst, HMONITOR mon, int index) {
 
     m_desktopDir = KnownFolder(FOLDERID_Desktop);
     m_publicDir = KnownFolder(FOLDERID_PublicDesktop);
+    {   // AETHER_DEMO_DESKTOP=<folder>: show that folder instead of the real desktop (the promo footage must not show somebody's own files)
+        // (or the folder named in %APPDATA%\Aether\demo-desktop.txt: a copy started through explorer.exe does not inherit the recorder's environment)
+        wchar_t demo[MAX_PATH] = {};
+        if (!GetEnvironmentVariableW(L"AETHER_DEMO_DESKTOP", demo, MAX_PATH)) {
+            demo[0] = 0;
+            wchar_t ad[MAX_PATH] = {};
+            if (GetEnvironmentVariableW(L"APPDATA", ad, MAX_PATH)) {
+                const std::wstring f = std::wstring(ad) + L"\\Aether\\demo-desktop.txt";
+                HANDLE h = CreateFileW(f.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE) {
+                    char b[1024] = {}; DWORD n = 0; ReadFile(h, b, sizeof(b) - 1, &n, nullptr); CloseHandle(h);
+                    while (n && (b[n - 1] == '\r' || b[n - 1] == '\n' || b[n - 1] == ' ')) b[--n] = 0;
+                    MultiByteToWideChar(CP_UTF8, 0, b, -1, demo, MAX_PATH);
+                }
+            }
+        }
+        if (demo[0] && GetFileAttributesW(demo) != INVALID_FILE_ATTRIBUTES) { m_desktopDir = demo; m_publicDir.clear(); }
+    }
     LoadCfg();
     if (m_cfgVer < 2) m_iconSize = 48.0f;
     LoadSlides();
@@ -837,8 +856,10 @@ LRESULT Desktop::Handle(UINT m, WPARAM w, LPARAM l) {
             }
             const ULONGLONG tn = GetTickCount64();
             for (auto it = m_pendingDrop.begin(); it != m_pendingDrop.end();) if (tn - it->second.second > 15000) it = m_pendingDrop.erase(it); else ++it;
-            static int n = 0;
-            if (++n % 5 == 0) { CheckBin(); LoadWallpaper(false); }
+            // per desktop (one per monitor, all in this process): a shared counter alternated between them, so one of the desktops
+            // never saw an even tick and never noticed Wallpaper Engine starting or stopping
+            const int n = ++m_syncN;
+            if (n % 5 == 0) { CheckBin(); LoadWallpaper(false); }
             if (n % 2 == 0) {
                 const bool live = system::wallpaper::we::Running();
                 if (live != m_liveWall) { m_liveWall = live; SetExplorerIconsHidden(live); LoadWallpaper(true); Kick(); }

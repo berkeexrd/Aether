@@ -265,8 +265,11 @@ void RunFileOp(HWND owner, Op op, std::vector<std::wstring> src, std::wstring de
                 DWORD cookie = 0; bool advised = false;
                 if (job) { ComPtr<IFileOperationProgressSink> sink; sink.Attach(new OpSink(job, owner)); advised = SUCCEEDED(fo->Advise(sink.Get(), &cookie)); }
                 fo->SetOwnerWindow(owner);
-                if (op == Op::DeletePerm) fo->SetOperationFlags(FOF_NOCONFIRMMKDIR);
-                else fo->SetOperationFlags(FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOFX_RECYCLEONDELETE);
+                // AETHER_DEMO (showcase recording): no Windows progress window, the Aether progress card is the only one
+                wchar_t demoEnv[4] = {};
+                const DWORD quiet = GetEnvironmentVariableW(L"AETHER_DEMO", demoEnv, 4) ? FOF_SILENT : 0;
+                if (op == Op::DeletePerm) fo->SetOperationFlags(FOF_NOCONFIRMMKDIR | quiet);
+                else fo->SetOperationFlags(FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOFX_RECYCLEONDELETE | quiet);
                 ComPtr<IShellItem> destItem;
                 if (!dest.empty()) SHCreateItemFromParsingName(dest.c_str(), nullptr, IID_PPV_ARGS(&destItem));
                 for (const auto& p : src) {

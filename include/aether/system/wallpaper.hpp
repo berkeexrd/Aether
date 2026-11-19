@@ -79,7 +79,17 @@ inline std::wstring RunningExe() {
     CloseHandle(snap);
     return found;
 }
-inline bool Running() { return !RunningExe().empty(); }
+// Running is decided by the process name alone: the image path can be unreadable (other session / rights) while the engine is still painting.
+inline bool Running() {
+    bool yes = false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+    for (BOOL ok = Process32FirstW(snap, &pe); ok && !yes; ok = Process32NextW(snap, &pe))
+        yes = _wcsicmp(pe.szExeFile, L"wallpaper64.exe") == 0 || _wcsicmp(pe.szExeFile, L"wallpaper32.exe") == 0;
+    CloseHandle(snap);
+    return yes;
+}
 
 // Shows `path` (an image) in Wallpaper Engine. Returns false when it is not running.
 inline bool Apply(const std::wstring& path) {
@@ -115,7 +125,7 @@ inline void ApplyForTheme(int theme) {
     const std::wstring path = dir + FileFor(theme);
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
     const std::wstring cur = Current();
-    if (_wcsicmp(cur.c_str(), path.c_str()) == 0) return;
+    if (_wcsicmp(cur.c_str(), path.c_str()) == 0) { we::Apply(path); return; }   // Windows already has it, but Wallpaper Engine may still show another one
     // remember the user's own wallpaper the first time we replace it
     const std::wstring store = AppDataDir() + L"\\orig_wallpaper.txt";
     if (!cur.empty() && cur.find(dir) == std::wstring::npos && GetFileAttributesW(store.c_str()) == INVALID_FILE_ATTRIBUTES) {
