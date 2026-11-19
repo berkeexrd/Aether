@@ -35,29 +35,42 @@ void Theme::UseGlassTheme(int index) {
     m_themeIndex = render::glass::ThemeIndex();
     const auto& t = render::glass::CurrentTheme();
     const float ar = t.accent.r, ag = t.accent.g, ab = t.accent.b;
-    // The settings surface is built from the LIT colour of the theme with a breath of its accent (a deep violet, a deep blue ...),
-    // not from the near-black pill body, so the window reads as a coloured surface instead of a black box.
-    const bool oled0 = index == 1;
-    const float tint = oled0 ? 0.0f : (t.flat ? 0.05f : 0.13f);
-    const float br = t.bodyTop.r * (1.0f - tint) + ar * tint, bg = t.bodyTop.g * (1.0f - tint) + ag * tint, bb = t.bodyTop.b * (1.0f - tint) + ab * tint;
-    auto lift = [&](float add, float accMix, float alpha = 1.0f) {
-        return ImVec4(std::min(br + add + ar * accMix, 1.0f), std::min(bg + add + ag * accMix, 1.0f), std::min(bb + add + ab * accMix, 1.0f), alpha);
-    };
+    const float lr = t.light.r, lg = t.light.g, lb = t.light.b;
     const bool oled = index == 1;
-    m_colors.Background = ImVec4(br * 0.74f, bg * 0.74f, bb * 0.74f, 1.0f);      // bottom of the window gradient
-    m_colors.Shell = oled ? ImVec4(0.02f, 0.02f, 0.025f, 1) : lift(0.012f, 0.0f);
-    m_colors.Surface = lift(oled ? 0.045f : 0.030f, 0.004f);
-    m_colors.SurfaceElevated = lift(oled ? 0.060f : 0.050f, 0.008f);
-    m_colors.SurfaceHover = lift(0.090f, 0.016f);
-    m_colors.SurfaceActive = lift(0.120f, 0.024f);
-    m_colors.SurfaceOverlay = lift(0.060f, 0.010f, 0.97f);
-    m_colors.Border = lift(0.110f, 0.020f);
-    m_colors.BorderSubtle = lift(0.075f, 0.012f);
-    m_colors.BorderHover = lift(0.200f, 0.040f);
-    m_colors.TextSecondary = ImVec4(0.80f, 0.80f, 0.87f, 1.0f);                   // the surface is lighter now: lift the greys a little
-    m_colors.TextMuted = ImVec4(0.61f, 0.61f, 0.70f, 1.0f);
-    m_colors.TextDisabled = ImVec4(0.42f, 0.42f, 0.51f, 1.0f);
-    SetAccentColor(0xFF000000u | (static_cast<uint32_t>(ar * 255.0f + 0.5f) << 16) | (static_cast<uint32_t>(ag * 255.0f + 0.5f) << 8) | static_cast<uint32_t>(ab * 255.0f + 0.5f));
+
+    // Deep obsidian-glass palette matching AetherDesktop's Customize ("Özelleştir") window:
+    // clean dark navy-obsidian base so the top accent wash and crisp hairline rims breathe without muddy purple cards.
+    const float baseR = oled ? 0.018f : (0.036f + ar * 0.018f);
+    const float baseG = oled ? 0.018f : (0.032f + ag * 0.016f);
+    const float baseB = oled ? 0.024f : (0.072f + ab * 0.024f);
+    auto lift = [&](float add, float accMix, float alpha = 1.0f) {
+        return ImVec4(std::min(baseR + add + ar * accMix, 1.0f),
+                      std::min(baseG + add + ag * accMix, 1.0f),
+                      std::min(baseB + add + ab * accMix, 1.0f), alpha);
+    };
+
+    m_colors.Background      = ImVec4(baseR, baseG, baseB, 1.0f);
+    m_colors.Shell           = lift(0.008f, 0.004f);
+    m_colors.Surface         = lift(0.032f, 0.008f);
+    m_colors.SurfaceElevated = lift(0.056f, 0.012f);
+    m_colors.SurfaceHover    = lift(0.092f, 0.020f);
+    m_colors.SurfaceActive   = lift(0.125f, 0.030f);
+    m_colors.SurfaceOverlay  = ImVec4(baseR + 0.016f, baseG + 0.014f, baseB + 0.024f, 0.97f);
+    m_colors.Border          = ImVec4(1.0f, 1.0f, 1.0f, 0.13f);
+    m_colors.BorderSubtle    = ImVec4(1.0f, 1.0f, 1.0f, 0.075f);
+    m_colors.BorderHover     = ImVec4(lr, lg, lb, 0.55f);
+    m_colors.TextPrimary     = ImVec4(0.955f, 0.955f, 0.975f, 1.0f);
+    m_colors.TextSecondary   = ImVec4(0.72f, 0.74f, 0.81f, 1.0f);
+    m_colors.TextMuted       = ImVec4(0.52f, 0.55f, 0.64f, 1.0f);
+    m_colors.TextDisabled    = ImVec4(0.34f, 0.36f, 0.44f, 1.0f);
+
+    m_colors.Accent          = ImVec4(ar, ag, ab, 1.0f);
+    m_colors.AccentHover     = ImVec4(lr, lg, lb, 1.0f);
+    m_colors.AccentActive    = ImVec4(ar * 0.82f, ag * 0.82f, ab * 0.82f, 1.0f);
+    m_colors.AccentMuted     = ImVec4(ar, ag, ab, 0.28f);
+    m_colors.AccentGlow      = ImVec4(lr, lg, lb, 0.42f);
+    m_colors.BorderFocus     = ImVec4(lr, lg, lb, 0.85f);
+    Apply();
 }
 
 void Theme::Apply() {

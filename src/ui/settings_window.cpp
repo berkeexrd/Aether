@@ -5,6 +5,7 @@
 #include "aether/ui/animation.hpp"
 #include "aether/core/log.hpp"
 #include "aether/core/i18n.hpp"
+#include "aether/config/config_manager.hpp"
 #include "aether/render/glass.hpp"
 #include <backends/imgui_impl_win32.h>
 #include <backends/imgui_impl_dx11.h>
@@ -379,20 +380,24 @@ void Glow(ImDrawList* dl, ImVec2 c, float rx, float ry, const ImVec4& col, float
         }
 }
 
-// The whole window surface: a vertical gradient from the theme's lit colour to its deep colour, two big accent lights (top left, bottom right),
-// a smaller highlight at the top, and a hairline edge. Static, so it costs nothing when the window is idle.
+// Exact Özelleştir-style obsidian glass backdrop: deep dark obsidian body, clean top-down accent wash,
+// subtle outer accent rim and no muddy bright purple wash.
 void PaintBackdrop(ImDrawList* dl, ImVec2 p, ImVec2 sz, const ThemeColors& th) {
     const ImVec2 q(p.x + sz.x, p.y + sz.y);
-    dl->AddRectFilledMultiColor(p, q, Col(th.SurfaceElevated), Col(th.SurfaceElevated), Col(th.Background), Col(th.Background));
+    dl->AddRectFilled(p, q, Col(th.Background));
     const int ti = render::glass::ThemeIndex();
     const auto& def = render::glass::CurrentTheme();
-    const float k = ti == 1 ? 0.30f : (def.flat ? 0.55f : 1.0f);          // OLED stays nearly black, flat themes get a quieter light
-    const ImVec4 a2(render::glass::kAccent2.r, render::glass::kAccent2.g, render::glass::kAccent2.b, 1.0f);
-    const ImVec4 a1 = th.Accent, a3 = th.AccentHover;
-    Glow(dl, ImVec2(p.x + sz.x * 0.12f, p.y + sz.y * 0.02f), sz.x * 0.70f, sz.y * 0.80f, a1, 0.30f * k);
-    Glow(dl, ImVec2(p.x + sz.x * 0.98f, p.y + sz.y * 1.02f), sz.x * 0.60f, sz.y * 0.78f, a2, 0.24f * k);
-    Glow(dl, ImVec2(p.x + sz.x * 0.72f, p.y + sz.y * -0.04f), sz.x * 0.34f, sz.y * 0.34f, a3, 0.10f * k);
-    dl->AddRect(ImVec2(p.x + 0.5f, p.y + 0.5f), ImVec2(q.x - 0.5f, q.y - 0.5f), IM_COL32(255, 255, 255, 26), Sc(8.0f), 0, 1.0f);   // matches the DWM corner radius
+    const float k = ti == 1 ? 0.35f : (def.flat ? 0.55f : 1.0f);
+    // Clean top-down accent light wash (0..220px) directly matching desktop/main.cpp DrawPanel()
+    const float washH = std::min(sz.y * 0.42f, Sc(240.0f));
+    dl->AddRectFilledMultiColor(
+        p, ImVec2(q.x, p.y + washH),
+        Col(th.Accent, 0.22f * k), Col(th.Accent, 0.16f * k),
+        Col(th.Accent, 0.0f), Col(th.Accent, 0.0f));
+    // Subtle ambient top-left radial glow for extra depth
+    Glow(dl, ImVec2(p.x + sz.x * 0.16f, p.y + Sc(18.0f)), sz.x * 0.46f, Sc(210.0f), th.Accent, 0.12f * k);
+    // Crisp accent-tinted outer hairline border (matches StrokeRR(..., WithA(vl, 0.42f), 1.2f))
+    dl->AddRect(ImVec2(p.x + 0.5f, p.y + 0.5f), ImVec2(q.x - 0.5f, q.y - 0.5f), Col(th.AccentHover, 0.42f * k + 0.12f), Sc(8.0f), 0, 1.2f);
 }
 
 } // namespace
@@ -422,7 +427,9 @@ void SettingsWindow::Render() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 
-    if (render::glass::SyncTheme()) Theme::Instance().UseGlassTheme(render::glass::ThemeIndex());
+    if (render::glass::SyncTheme() || Theme::Instance().ThemeIndex() != render::glass::ThemeIndex()) {
+        Theme::Instance().UseGlassTheme(render::glass::ThemeIndex());
+    }
     const auto& theme = Theme::Instance().Colors();
 
     const ImVec4 winBg(theme.Background.x, theme.Background.y, theme.Background.z, 1.0f);
@@ -437,79 +444,99 @@ void SettingsWindow::Render() {
         if (SettingsPages::WelcomeNeeded()) {
             SettingsPages::RenderWelcome(W, H);
         } else {
-        const float sbW = Sc(262.0f);
+        const float sbW = Sc(256.0f);
         const ImVec2 w0 = ImGui::GetWindowPos();
 
-        // ---- SIDEBAR: a darker glass strip that belongs to the window (no floating box) ----------------------------
-        {
-            const ImVec2 a = w0, b(w0.x + sbW, w0.y + H), mid(b.x, w0.y + H * 0.5f);
-            bg->AddRectFilledMultiColor(a, b, IM_COL32(0, 0, 0, 38), IM_COL32(0, 0, 0, 38), IM_COL32(0, 0, 0, 92), IM_COL32(0, 0, 0, 92));
-            bg->AddRectFilledMultiColor(ImVec2(b.x - 1.0f, a.y), ImVec2(b.x, mid.y), IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 30), IM_COL32(255, 255, 255, 30));
-            bg->AddRectFilledMultiColor(ImVec2(b.x - 1.0f, mid.y), b, IM_COL32(255, 255, 255, 30), IM_COL32(255, 255, 255, 30), IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 0));
-        }
+        // Single clean Özelleştir hairline vertical divider (no dark separate sidebar box!)
+        bg->AddRectFilled(ImVec2(w0.x + sbW, w0.y + Sc(20.0f)), ImVec2(w0.x + sbW + 1.0f, w0.y + H - Sc(20.0f)), IM_COL32(255, 255, 255, 20));
+
         ImGui::SetCursorPos(ImVec2(0.0f, 0.0f));
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Sc(16.0f), 0.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Sc(22.0f), 0.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
         ImGui::BeginChild("SidebarRegion", ImVec2(sbW, H), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
         {
             const ImVec2 o = ImGui::GetCursorScreenPos();
             ImDrawList* dl = ImGui::GetWindowDrawList();
-            // brand: rounded gradient tile with a soft glow, name and product line
-            const float ts0 = Sc(44.0f);
-            const ImVec2 b0(o.x + Sc(4.0f), o.y + Sc(22.0f)), b1(b0.x + ts0, b0.y + ts0);
-            dl->AddRectFilled(ImVec2(b0.x - Sc(7.0f), b0.y - Sc(5.0f)), ImVec2(b1.x + Sc(7.0f), b1.y + Sc(9.0f)), Col(theme.Accent, 0.10f), Sc(22.0f));
-            dl->AddRectFilled(ImVec2(b0.x - Sc(3.0f), b0.y - Sc(2.0f)), ImVec2(b1.x + Sc(3.0f), b1.y + Sc(4.0f)), Col(theme.Accent, 0.16f), Sc(18.0f));
-            dl->AddRectFilled(b0, b1, Col(theme.Accent), Sc(14.0f));
-            dl->AddRectFilled(b0, ImVec2(b1.x, b0.y + ts0 * 0.52f), IM_COL32(255, 255, 255, 46), Sc(14.0f), ImDrawFlags_RoundCornersTop);
-            dl->AddRect(b0, b1, IM_COL32(255, 255, 255, 70), Sc(14.0f), 0, 1.0f);
+            const float pw = sbW - Sc(44.0f);
+
+            // Exact Özelleştir sidebar heading: clean bold title + subtle muted subtitle (no boxy logo tile)
             if (FontTitle) ImGui::PushFont(FontTitle);
-            const ImVec2 ls = ImGui::CalcTextSize("A");
-            dl->AddText(ImVec2(b0.x + (ts0 - ls.x) * 0.5f, b0.y + (ts0 - ls.y) * 0.5f - 1.0f), IM_COL32(255, 255, 255, 255), "A");
+            dl->AddText(ImVec2(o.x, o.y + Sc(18.0f)), Col(theme.TextPrimary), L10N("Settings", "Ayarlar"));
             if (FontTitle) ImGui::PopFont();
-            if (FontBold) ImGui::PushFont(FontBold);
-            dl->AddText(ImVec2(b1.x + Sc(14.0f), b0.y + Sc(2.0f)), Col(theme.TextPrimary), "Aether");
-            if (FontBold) ImGui::PopFont();
             if (FontSmall) ImGui::PushFont(FontSmall);
-            dl->AddText(ImVec2(b1.x + Sc(14.0f), b0.y + Sc(24.0f)), Col(theme.TextMuted), L10N("Control Center", "Kontrol Merkezi"));
+            dl->AddText(ImVec2(o.x, o.y + Sc(50.0f)), Col(theme.TextMuted), L10N("Customise Aether to your liking", "Aether'i kendine göre ayarla"));
             if (FontSmall) ImGui::PopFont();
 
-            // feature search (pill)
-            ImGui::SetCursorPosY(Sc(92.0f));
+            // Live Mini Desktop & Shell Preview Card (signature Özelleştir element!)
             {
-                ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(1, 1, 1, 0.065f));
-                ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.09f));
+                const float prY = o.y + Sc(78.0f);
+                const float prH = std::round(pw * 0.56f);
+                const ImVec2 p0(o.x, prY), p1(o.x + pw, prY + prH);
+                const ImU32 gTL = ImGui::GetColorU32(ImVec4(theme.Accent.x * 0.52f, theme.Accent.y * 0.52f, theme.Accent.z * 0.52f, 1.0f));
+                const ImU32 gTR = ImGui::GetColorU32(ImVec4(theme.Accent.x * 0.18f + 0.02f, theme.Accent.y * 0.18f + 0.02f, theme.Accent.z * 0.18f + 0.06f, 1.0f));
+                const ImU32 gBL = ImGui::GetColorU32(ImVec4(theme.Accent.x * 0.24f + 0.02f, theme.Accent.y * 0.24f + 0.02f, theme.Accent.z * 0.24f + 0.06f, 1.0f));
+                const ImU32 gBR = ImGui::GetColorU32(ImVec4(0.028f, 0.020f, 0.068f, 1.0f));
+                dl->PushClipRect(p0, p1, true);
+                dl->AddRectFilledMultiColor(p0, p1, gTL, gTR, gBR, gBL);
+                // Subtle mini Dynamic Island pill at top-center
+                const float islW = Sc(38.0f), islH = Sc(6.0f);
+                dl->AddRectFilled(ImVec2((p0.x + p1.x - islW) * 0.5f, p0.y + Sc(6.0f)), ImVec2((p0.x + p1.x + islW) * 0.5f, p0.y + Sc(6.0f) + islH), IM_COL32(8, 8, 14, 225), Sc(3.0f));
+                // 6 mini desktop icons (first glowing in active accentLight!)
+                const float ic = Sc(16.0f);
+                for (int k = 0; k < 6; ++k) {
+                    const float ix = p0.x + Sc(12.0f) + (k % 3) * (ic + Sc(11.0f));
+                    const float iy = p0.y + Sc(16.0f) + (k / 3) * (ic + Sc(14.0f));
+                    if (k == 0) dl->AddRectFilled(ImVec2(ix - Sc(3.0f), iy - Sc(3.0f)), ImVec2(ix + ic + Sc(3.0f), iy + ic + Sc(3.0f)), Col(theme.AccentHover, 0.28f), Sc(7.0f));
+                    dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + ic, iy + ic), k == 0 ? Col(theme.AccentHover, 0.90f) : IM_COL32(255, 255, 255, 140), Sc(4.5f));
+                    dl->AddRectFilled(ImVec2(ix + Sc(1.5f), iy + ic + Sc(3.5f)), ImVec2(ix + ic - Sc(1.5f), iy + ic + Sc(5.5f)), IM_COL32(255, 255, 255, 175), Sc(1.0f));
+                }
+                // Mini clock top-right ("14:32") + underline
+                if (FontSmall) ImGui::PushFont(FontSmall);
+                const ImVec2 cs = ImGui::CalcTextSize("14:32");
+                dl->AddText(ImVec2(p1.x - Sc(10.0f) - cs.x, p0.y + Sc(10.0f)), IM_COL32(255, 255, 255, 235), "14:32");
+                if (FontSmall) ImGui::PopFont();
+                dl->AddRectFilled(ImVec2(p1.x - Sc(42.0f), p0.y + Sc(28.0f)), ImVec2(p1.x - Sc(10.0f), p0.y + Sc(30.5f)), IM_COL32(255, 255, 255, 115), Sc(1.5f));
+                // Mini dock bar at bottom
+                dl->AddRectFilled(ImVec2(p0.x + Sc(12.0f), p1.y - Sc(10.0f)), ImVec2(p1.x - Sc(12.0f), p1.y - Sc(5.5f)), IM_COL32(255, 255, 255, 58), Sc(2.5f));
+                dl->PopClipRect();
+                dl->AddRect(p0, p1, IM_COL32(255, 255, 255, 36), Sc(10.0f), 0, 1.0f);
+            }
+
+            // Compact clean search pill (Ctrl+F) right under the preview card
+            const float searchY = Sc(78.0f) + std::round(pw * 0.56f) + Sc(14.0f);
+            ImGui::SetCursorPosY(searchY);
+            {
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(1, 1, 1, 0.055f));
+                ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.10f));
                 ImGui::PushStyleColor(ImGuiCol_Text, theme.TextPrimary);
-                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, Sc(15.0f));
-                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(Sc(36.0f), Sc(9.0f)));
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, Sc(10.0f));
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(Sc(32.0f), Sc(6.5f)));
                 ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                ImGui::SetNextItemWidth(pw);
                 if (m_focusSearch) { ImGui::SetKeyboardFocusHere(); m_focusSearch = false; }
-                const bool entered = ImGui::InputTextWithHint("##featuresearch", L10N("Search settings  (Ctrl+F)", "Ayar ara  (Ctrl+F)"), m_query, sizeof(m_query), ImGuiInputTextFlags_EnterReturnsTrue);
+                const bool entered = ImGui::InputTextWithHint("##featuresearch", L10N("Search  (Ctrl+F)", "Ara  (Ctrl+F)"), m_query, sizeof(m_query), ImGuiInputTextFlags_EnterReturnsTrue);
                 const bool boxActive = ImGui::IsItemActive();
                 const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
                 ImGui::PopStyleVar(3);
                 ImGui::PopStyleColor(3);
-                if (boxActive) {
-                    dl->AddRect(a, b, Col(theme.Accent, 0.85f), Sc(15.0f), 0, 1.5f);
-                    dl->AddRect(ImVec2(a.x - 2.0f, a.y - 2.0f), ImVec2(b.x + 2.0f, b.y + 2.0f), Col(theme.Accent, 0.22f), Sc(17.0f), 0, 2.0f);
-                }
+                if (boxActive) dl->AddRect(a, b, Col(theme.AccentHover, 0.80f), Sc(10.0f), 0, 1.2f);
                 if (boxActive && ImGui::IsKeyPressed(ImGuiKey_Escape)) m_query[0] = '\0';
                 if (FontIcons) {
                     ImGui::PushFont(FontIcons);
                     const std::string g = utf8(0xE721);
                     const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
-                    dl->AddText(ImVec2(a.x + Sc(13.0f), a.y + (b.y - a.y - gs.y) * 0.5f), Col(boxActive ? theme.AccentHover : theme.TextMuted), g.c_str());
+                    dl->AddText(ImVec2(a.x + Sc(10.0f), a.y + (b.y - a.y - gs.y) * 0.5f), Col(boxActive ? theme.AccentHover : theme.TextMuted), g.c_str());
                     ImGui::PopFont();
                 }
                 if (m_query[0]) {
-                    ImGui::SetCursorScreenPos(ImVec2(b.x - Sc(32.0f), a.y));
-                    if (ImGui::InvisibleButton("##clearsearch", ImVec2(Sc(28.0f), b.y - a.y))) m_query[0] = '\0';
+                    ImGui::SetCursorScreenPos(ImVec2(b.x - Sc(28.0f), a.y));
+                    if (ImGui::InvisibleButton("##clearsearch", ImVec2(Sc(24.0f), b.y - a.y))) m_query[0] = '\0';
                     if (FontIcons) {
                         ImGui::PushFont(FontIcons);
                         const std::string g = utf8(0xE711);
                         const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
-                        dl->AddText(ImVec2(b.x - Sc(32.0f) + (Sc(28.0f) - gs.x) * 0.5f, a.y + (b.y - a.y - gs.y) * 0.5f),
+                        dl->AddText(ImVec2(b.x - Sc(28.0f) + (Sc(24.0f) - gs.x) * 0.5f, a.y + (b.y - a.y - gs.y) * 0.5f),
                                     Col(ImGui::IsItemHovered() ? theme.TextPrimary : theme.TextMuted), g.c_str());
                         ImGui::PopFont();
                     }
@@ -517,53 +544,60 @@ void SettingsWindow::Render() {
                 if (entered) m_enterPressed = true;
                 m_searchBoxBottom = b.y;
             }
-            ImGui::SetCursorPosY(Sc(92.0f) + Sc(38.0f) + Sc(6.0f));
 
-            auto group = [&](const char* title) {
-                ImGui::Dummy(ImVec2(0.0f, Sc(14.0f)));
-                if (FontSmall) ImGui::PushFont(FontSmall);
-                const ImVec2 p = ImGui::GetCursorScreenPos();
-                const float availW = ImGui::GetContentRegionAvail().x, padX = Sc(8.0f), fs = ImGui::GetFontSize();
-                const float tw = ImGui::CalcTextSize(title).x;
-                dl->AddText(ImVec2(p.x + padX, p.y), Col(theme.TextMuted, 0.80f), title);
-                dl->AddRectFilledMultiColor(ImVec2(p.x + padX + tw + Sc(10.0f), p.y + fs * 0.5f), ImVec2(p.x + availW, p.y + fs * 0.5f + 1.0f),
-                                            IM_COL32(255, 255, 255, 26), IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 26));
-                ImGui::Dummy(ImVec2(availW, fs + Sc(6.0f)));
-                if (FontSmall) ImGui::PopFont();
-            };
+            // Clean scrollable navigation pill list (zero uppercase group clutter, zero boxed icon squares)
+            const float footerH = Sc(64.0f);
+            const float navY = searchY + Sc(40.0f);
+            const float navH = std::max(Sc(120.0f), H - navY - footerH);
+            ImGui::SetCursorPos(ImVec2(Sc(16.0f), navY));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Sc(0.0f), Sc(4.0f)));
+            ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, Sc(4.0f));
+            ImGui::BeginChild("NavScroll", ImVec2(sbW - Sc(32.0f), navH), 0, ImGuiWindowFlags_NoBackground);
             auto nav = [&](SettingsTab tab, const char* id, const char* label, unsigned icon) {
                 const std::string ic = utf8(icon);
-                if (UI::SidebarItem(id, label, m_activeTab == tab, Sc(42.0f), ic.c_str())) m_activeTab = tab;
-                ImGui::Dummy(ImVec2(0.0f, Sc(2.0f)));
+                if (UI::SidebarItem(id, label, m_activeTab == tab, Sc(38.0f), ic.c_str())) m_activeTab = tab;
+                ImGui::Dummy(ImVec2(0.0f, Sc(4.0f)));
             };
-            group(L10N("GENERAL", "GENEL"));
-            nav(SettingsTab::General,       "nav_gen",    L10N("General", "Genel"), 0xE713);
-            nav(SettingsTab::Appearance,    "nav_app",    L10N("Appearance & Themes", "Görünüm ve Temalar"), 0xE790);
-            group(L10N("COMPONENTS", "BİLEŞENLER"));
-            nav(SettingsTab::DynamicIsland, "nav_island", "Dynamic Island", 0xE8B2);
-            nav(SettingsTab::Widgets,       "nav_widg",   L10N("Widgets", "Widget'lar"), 0xE8A1);
-            nav(SettingsTab::Desktop,       "nav_desk",   L10N("Desktop", "Masaüstü"), 0xE7F4);
-            group(L10N("SYSTEM", "SİSTEM"));
-            nav(SettingsTab::Media,            "nav_med",  L10N("Media", "Medya"), 0xE8D6);
-            nav(SettingsTab::SystemMonitoring, "nav_sys",  L10N("Hardware Monitor", "Donanım İzleme"), 0xEEA1);
-            nav(SettingsTab::GamingMode,       "nav_game", L10N("Gaming Mode", "Oyun Modu"), 0xE7FC);
-            nav(SettingsTab::About,            "nav_abt",  L10N("About", "Hakkında"), 0xE946);
+            nav(SettingsTab::General,          "nav_gen",    L10N("General", "Genel"), 0xE713);
+            nav(SettingsTab::Appearance,       "nav_app",    L10N("Themes & look", "Görünüm ve renk"), 0xE790);
+            nav(SettingsTab::DynamicIsland,    "nav_island", "Dynamic Island", 0xE8B2);
+            nav(SettingsTab::Widgets,          "nav_widg",   L10N("Widgets", "Widget'lar"), 0xE8A1);
+            nav(SettingsTab::Desktop,          "nav_desk",   L10N("Desktop", "Masaüstü"), 0xE7F4);
+            nav(SettingsTab::Media,            "nav_med",    L10N("Media", "Medya"), 0xE8D6);
+            nav(SettingsTab::SystemMonitoring, "nav_sys",    L10N("Hardware", "Donanım"), 0xEEA1);
+            nav(SettingsTab::GamingMode,       "nav_game",   L10N("Gaming Mode", "Oyun Modu"), 0xE7FC);
+            nav(SettingsTab::About,            "nav_abt",    L10N("About", "Hakkında"), 0xE946);
+            ImGui::EndChild();
+            ImGui::PopStyleVar(2);
 
-            // footer: status card (hidden on very short windows so it never overlaps the list)
-            const float cardH = Sc(52.0f), fy = H - cardH - Sc(16.0f);
-            if (ImGui::GetCursorPosY() + Sc(8.0f) < fy) {
-                const ImVec2 cw0 = ImGui::GetWindowPos();
-                const ImVec2 p0(cw0.x + Sc(16.0f), cw0.y + fy), p1(cw0.x + sbW - Sc(16.0f), cw0.y + fy + cardH);
-                dl->AddRectFilled(p0, p1, IM_COL32(255, 255, 255, 13), Sc(15.0f));
-                dl->AddRect(p0, p1, IM_COL32(255, 255, 255, 20), Sc(15.0f), 0, 1.0f);
-                const ImVec2 dot(p0.x + Sc(22.0f), (p0.y + p1.y) * 0.5f);
-                dl->AddCircleFilled(dot, Sc(9.0f), Col(theme.Success, 0.16f));
-                dl->AddCircleFilled(dot, Sc(4.5f), Col(theme.Success));
+            // Bottom Özelleştir-style outlined pill button ("Varsayılana döndür")
+            {
+                const float rbH = Sc(36.0f), rbY = H - rbH - Sc(18.0f);
+                ImGui::SetCursorPos(ImVec2(Sc(22.0f), rbY));
+                const bool clicked = ImGui::InvisibleButton("##reset_defaults", ImVec2(pw, rbH));
+                const bool hot = ImGui::IsItemHovered();
+                const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+                dl->AddRectFilled(a, b, IM_COL32(255, 255, 255, hot ? 34 : 18), Sc(11.0f));
+                dl->AddRect(a, b, IM_COL32(255, 255, 255, hot ? 56 : 36), Sc(11.0f), 0, 1.0f);
+                if (FontIcons) {
+                    ImGui::PushFont(FontIcons);
+                    const std::string g = utf8(0xE777);
+                    const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
+                    dl->AddText(ImVec2(a.x + Sc(12.0f), a.y + (rbH - gs.y) * 0.5f), Col(theme.TextPrimary), g.c_str());
+                    ImGui::PopFont();
+                }
                 if (FontSmall) ImGui::PushFont(FontSmall);
-                const float fh = ImGui::GetFontSize();
-                dl->AddText(ImVec2(p0.x + Sc(42.0f), (p0.y + p1.y) * 0.5f - fh - 1.0f), Col(theme.TextPrimary, 0.92f), L10N("Running", "Çalışıyor"));
-                dl->AddText(ImVec2(p0.x + Sc(42.0f), (p0.y + p1.y) * 0.5f + 1.0f), Col(theme.TextMuted), L10N("Version 1.0", "Sürüm 1.0"));
+                const char* rlbl = L10N("Reset to defaults", "Varsayılana döndür");
+                const ImVec2 ts = ImGui::CalcTextSize(rlbl);
+                dl->AddText(ImVec2(a.x + Sc(38.0f), a.y + (rbH - ts.y) * 0.5f), Col(theme.TextPrimary), rlbl);
                 if (FontSmall) ImGui::PopFont();
+                if (clicked) {
+                    config::ConfigManager::Instance().ResetToDefaults();
+                    config::ConfigManager::Instance().Save();
+                    Theme::Instance().UseGlassTheme(0);
+                    render::glass::SaveThemeFile(0);
+                    UI::AddToast(UI::ToastType::Info, L10N("Defaults restored", "Varsayılana döndürüldü"), L10N("Settings reset cleanly.", "Ayarlar varsayılana sıfırlandı."));
+                }
             }
         }
         ImGui::EndChild();
@@ -571,7 +605,7 @@ void SettingsWindow::Render() {
         ImGui::PopStyleColor();
 
         // ---- HEADER + PAGE ----------------------------------------------------------------------------------------------
-        const float cx0 = sbW, cw = W - sbW, headH = Sc(92.0f);
+        const float cx0 = sbW, cw = W - sbW, headH = Sc(82.0f);
         struct Head { const char* title; const char* sub; };
         const Head heads[] = {
             {L10N("General", "Genel"), L10N("Startup, display and shortcuts", "Başlangıç, ekran ve kısayollar")},
@@ -579,16 +613,15 @@ void SettingsWindow::Render() {
             {L10N("Widgets", "Widget'lar"), L10N("Live cards on your desktop", "Masaüstündeki canlı kartlar")},
             {L10N("Taskbar", "Görev Çubuğu"), L10N("Material of the Windows taskbar", "Windows görev çubuğunun malzemesi")},
             {L10N("Desktop", "Masaüstü"), L10N("Wallpaper, icons and desktop items", "Duvar kağıdı, simgeler ve masaüstü öğeleri")},
-            {L10N("Appearance & Themes", "Görünüm ve Temalar"), L10N("Pick the look of the whole shell", "Tüm arayüzün görünümünü seç")},
+            {L10N("Themes & look", "Görünüm ve renk"), L10N("Pick the look of the whole shell", "Tüm arayüzün görünümünü seç")},
             {L10N("Motion", "Hareket"), L10N("Spring physics", "Yay fiziği")},
             {L10N("Media", "Medya"), L10N("Music and video playback", "Müzik ve video oynatma")},
-            {L10N("Hardware Monitor", "Donanım İzleme"), L10N("Live CPU, memory, graphics and network", "Canlı CPU, bellek, ekran kartı ve ağ")},
+            {L10N("Hardware", "Donanım"), L10N("Live CPU, memory, graphics and network", "Canlı CPU, bellek, ekran kartı ve ağ")},
             {L10N("Gaming Mode", "Oyun Modu"), L10N("Stay out of the way of games", "Oyunların yoluna çıkma")},
             {L10N("Shortcuts", "Kısayollar"), L10N("Global hotkeys", "Genel kısayol tuşları")},
             {L10N("Diagnostics", "Tanılama"), L10N("Rendering status", "Çizim durumu")},
             {L10N("About", "Hakkında"), L10N("About Aether", "Aether hakkında")},
         };
-        static const unsigned kTabIcon[13] = {0xE713, 0xE8B2, 0xE8A1, 0xE700, 0xE7F4, 0xE790, 0xE916, 0xE8D6, 0xEEA1, 0xE7FC, 0xE765, 0xE9D9, 0xE946};
         const bool searching = m_query[0] != '\0';
         if (searching) {
             if (!m_indexBuilt || m_indexTurkish != aether::i18n::Turkish()) BuildSearchIndex();
@@ -606,53 +639,43 @@ void SettingsWindow::Render() {
         const Head searchHead{L10N("Search", "Arama"), subBuf};
         const bool showSearch = m_query[0] != '\0';
         const Head& h = showSearch ? searchHead : heads[static_cast<int>(m_activeTab)];
-        const unsigned headIcon = showSearch ? 0xE721u : kTabIcon[static_cast<int>(m_activeTab)];
 
-        // page title: accent tile with the page glyph, then title and subtitle
-        const float tx = cx0 + Sc(36.0f);
+        // Exact Özelleştir content header: clean bold title + muted subtitle (NO boxed icon tile!)
+        const float tx = cx0 + Sc(34.0f);
         {
-            const float tsz = Sc(46.0f);
-            const ImVec2 a(w0.x + tx, w0.y + Sc(22.0f)), b(a.x + tsz, a.y + tsz);
-            bg->AddRectFilled(ImVec2(a.x - Sc(4.0f), a.y - Sc(3.0f)), ImVec2(b.x + Sc(4.0f), b.y + Sc(6.0f)), Col(theme.Accent, 0.13f), Sc(18.0f));
-            bg->AddRectFilled(a, b, Col(theme.Accent, 0.22f), Sc(14.0f));
-            bg->AddRect(a, b, Col(theme.Accent, 0.55f), Sc(14.0f), 0, 1.0f);
-            if (FontIcons) {
-                const std::string g = utf8(headIcon);
-                ImGui::PushFont(FontIcons);
-                const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
-                bg->AddText(ImVec2(a.x + (tsz - gs.x) * 0.5f, a.y + (tsz - gs.y) * 0.5f), Col(theme.AccentHover), g.c_str());
-                ImGui::PopFont();
-            }
-            ImGui::SetCursorPos(ImVec2(tx + tsz + Sc(16.0f), Sc(17.0f)));
+            ImGui::SetCursorPos(ImVec2(tx, Sc(18.0f)));
             if (FontTitle) ImGui::PushFont(FontTitle);
             ImGui::TextColored(theme.TextPrimary, "%s", h.title);
             if (FontTitle) ImGui::PopFont();
-            ImGui::SetCursorPos(ImVec2(tx + tsz + Sc(17.0f), Sc(54.0f)));
+            ImGui::SetCursorPos(ImVec2(tx, Sc(50.0f)));
+            if (FontSmall) ImGui::PushFont(FontSmall);
             ImGui::TextColored(theme.TextMuted, "%s", h.sub);
+            if (FontSmall) ImGui::PopFont();
         }
-        {   // caption buttons: 0 = minimise, 1 = close
-            const float bw = Sc(38.0f), bh = Sc(32.0f), by = Sc(20.0f);
+        {   // Exact Özelleştir circular frosted caption buttons: 0 = minimise, 1 = close
+            const float bs = Sc(32.0f), by = Sc(18.0f);
             for (int k = 0; k < 2; ++k) {
-                const float bx = W - Sc(18.0f) - (2 - k) * (bw + Sc(4.0f)) + Sc(4.0f);
+                const float bx = W - Sc(20.0f) - (2 - k) * (bs + Sc(8.0f)) + Sc(8.0f);
                 ImGui::SetCursorPos(ImVec2(bx, by));
                 char id[16]; snprintf(id, sizeof(id), "##cap%d", k);
-                const bool clicked = ImGui::InvisibleButton(id, ImVec2(bw, bh));
+                const bool clicked = ImGui::InvisibleButton(id, ImVec2(bs, bs));
                 const bool hov = ImGui::IsItemHovered();
                 const float ha = AnimationEngine::Instance().AnimateFloat(ImGui::GetID(id) ^ 0x2F1Bu, hov ? 1.0f : 0.0f, AnimationSpeed::Fast);
-                const ImVec2 a(w0.x + bx, w0.y + by), b(a.x + bw, a.y + bh);
-                if (ha > 0.01f) bg->AddRectFilled(a, b, k == 1 ? IM_COL32(232, 72, 85, static_cast<int>(235 * ha)) : IM_COL32(255, 255, 255, static_cast<int>(26 * ha)), Sc(11.0f));
+                const ImVec2 a(w0.x + bx, w0.y + by), b(a.x + bs, a.y + bs);
+                const ImU32 fill = (k == 1 && ha > 0.01f)
+                    ? IM_COL32(static_cast<int>(255 * (1 - ha) + 230 * ha), static_cast<int>(255 * (1 - ha) + 68 * ha), static_cast<int>(255 * (1 - ha) + 82 * ha), static_cast<int>(20 + 210 * ha))
+                    : IM_COL32(255, 255, 255, static_cast<int>(20 + 32 * ha));
+                bg->AddRectFilled(a, b, fill, bs * 0.5f);
                 if (FontIcons) {
-                    const std::string g = utf8(k == 0 ? 0xE921 : 0xE8BB);
+                    const std::string g = utf8(k == 0 ? 0xE921 : 0xE711);
                     ImGui::PushFont(FontIcons);
                     const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
-                    bg->AddText(ImVec2(a.x + (bw - gs.x) * 0.5f, a.y + (bh - gs.y) * 0.5f), k == 1 && hov ? IM_COL32(255, 255, 255, 255) : Col(theme.TextSecondary), g.c_str());
+                    bg->AddText(ImVec2(a.x + (bs - gs.x) * 0.5f, a.y + (bs - gs.y) * 0.5f), k == 1 && hov ? IM_COL32(255, 255, 255, 255) : Col(theme.TextPrimary, 0.85f), g.c_str());
                     ImGui::PopFont();
                 }
                 if (clicked) { if (k == 0) ShowWindow(m_hwnd, SW_MINIMIZE); else Show(false); }
             }
         }
-        bg->AddRectFilledMultiColor(ImVec2(w0.x + tx, w0.y + headH), ImVec2(w0.x + W - Sc(36.0f), w0.y + headH + 1.0f),
-                                    IM_COL32(255, 255, 255, 38), IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 38));
 
         // page transition: a new page fades in while rising a few pixels, and starts at the top
         static SettingsTab s_tab = m_activeTab;

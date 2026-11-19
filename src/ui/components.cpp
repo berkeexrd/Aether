@@ -1,5 +1,7 @@
 #include "aether/ui/components.hpp"
 #include "aether/ui/animation.hpp"
+#include "aether/core/i18n.hpp"
+#include <windows.h>
 #include <imgui_internal.h>
 #include <vector>
 #include <algorithm>
@@ -23,6 +25,26 @@ namespace UI {
 namespace {
 ImVec4 Lerp4(const ImVec4& a, const ImVec4& b, float t) { return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t); }
 ImVec4 WithAlpha(const ImVec4& c, float a) { return ImVec4(c.x, c.y, c.z, a); }
+std::string ToUpperLocaleUtf8(const char* s) {
+    if (!s || !s[0]) return {};
+    int wn = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    if (wn <= 1) return s;
+    std::wstring w(static_cast<size_t>(wn - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, w.data(), wn);
+    const wchar_t* loc = aether::i18n::Turkish() ? L"tr-TR" : L"en-US";
+    const DWORD flags = LCMAP_UPPERCASE | LCMAP_LINGUISTIC_CASING;
+    int un = LCMapStringEx(loc, flags, w.c_str(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr, 0);
+    if (un > 0) {
+        std::wstring u(static_cast<size_t>(un), L'\0');
+        LCMapStringEx(loc, flags, w.c_str(), static_cast<int>(w.size()), u.data(), un, nullptr, nullptr, 0);
+        w.swap(u);
+    }
+    int bn = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    if (bn <= 0) return s;
+    std::string out(static_cast<size_t>(bn), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), out.data(), bn, nullptr, nullptr);
+    return out;
+}
 }
 
 // Custom-drawn button: soft translucent fill + hairline border that ease towards the hover state; the primary one is the accent colour with a faint glow.
@@ -48,22 +70,18 @@ bool Button(const char* label, const ImVec2& size, bool primary) {
 
     ImVec4 fill, edge, text;
     if (primary) {
-        fill = Lerp4(theme.Accent, theme.AccentHover, hv);
-        if (down) fill = theme.AccentActive;
-        edge = WithAlpha(theme.AccentHover, 0.55f + 0.30f * hv);
+        fill = Lerp4(WithAlpha(theme.Accent, 0.46f), WithAlpha(theme.Accent, 0.62f), hv);
+        if (down) fill = WithAlpha(theme.Accent, 0.72f);
+        edge = WithAlpha(theme.AccentHover, 0.78f + 0.20f * hv);
         text = ImVec4(1, 1, 1, 1);
-        if (hv > 0.01f) dl->AddRectFilled(ImVec2(bb.Min.x - Sc(2.0f), bb.Min.y - Sc(1.0f)), ImVec2(bb.Max.x + Sc(2.0f), bb.Max.y + Sc(3.0f)), ImGui::GetColorU32(WithAlpha(theme.Accent, 0.22f * hv)), rad + Sc(3.0f));
     } else {
-        fill = Lerp4(ImVec4(1, 1, 1, 0.055f), ImVec4(1, 1, 1, 0.11f), hv);
-        if (down) fill = ImVec4(1, 1, 1, 0.16f);
-        edge = Lerp4(ImVec4(1, 1, 1, 0.09f), WithAlpha(theme.AccentHover, 0.55f), hv);
+        fill = Lerp4(ImVec4(1, 1, 1, 0.065f), ImVec4(1, 1, 1, 0.135f), hv);
+        if (down) fill = ImVec4(1, 1, 1, 0.18f);
+        edge = Lerp4(ImVec4(1, 1, 1, 0.13f), WithAlpha(theme.AccentHover, 0.55f), hv);
         text = theme.TextPrimary;
     }
     ImGui::RenderNavCursor(bb, id);
     dl->AddRectFilled(bb.Min, bb.Max, ImGui::GetColorU32(fill), rad);
-    if (primary) {   // a thin light edge along the top makes the accent fill feel lit from above
-        dl->AddLine(ImVec2(bb.Min.x + rad, bb.Min.y + 1.0f), ImVec2(bb.Max.x - rad, bb.Min.y + 1.0f), ImGui::GetColorU32(ImVec4(1, 1, 1, 0.22f)), 1.0f);
-    }
     dl->AddRect(bb.Min, bb.Max, ImGui::GetColorU32(edge), rad, 0, 1.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, text);
     ImGui::RenderTextClipped(ImVec2(bb.Min.x + Sc(8.0f), bb.Min.y), ImVec2(bb.Max.x - Sc(8.0f), bb.Max.y), label, nullptr, &ls, ImVec2(0.5f, 0.5f), &bb);
@@ -79,8 +97,8 @@ bool Toggle(const char* id, bool* value) {
     const ImGuiStyle& style = g.Style;
     const ImGuiID widgetId = window->GetID(id);
 
-    const float width = Sc(42.0f);
-    const float height = Sc(22.0f);
+    const float width = Sc(44.0f);
+    const float height = Sc(24.0f);
     const ImVec2 pos = window->DC.CursorPos;
     const ImRect bb(pos, ImVec2(pos.x + width, pos.y + height));
 
@@ -99,27 +117,24 @@ bool Toggle(const char* id, bool* value) {
     float animT = AnimationEngine::Instance().AnimateFloat(widgetId, targetAnim, AnimationSpeed::Fast);
 
     const auto& theme = Theme::Instance().Colors();
-    ImVec4 offBg = hovered ? theme.SurfaceHover : theme.SurfaceElevated;
-    ImVec4 onBg = hovered ? theme.AccentHover : theme.Accent;
-    ImVec4 currentBg = ImVec4(
-        offBg.x + (onBg.x - offBg.x) * animT,
-        offBg.y + (onBg.y - offBg.y) * animT,
-        offBg.z + (onBg.z - offBg.z) * animT,
-        1.0f
-    );
+    ImVec4 offBg = ImVec4(1.0f, 1.0f, 1.0f, hovered ? 0.22f : 0.15f);
+    ImVec4 onBg = WithAlpha(theme.Accent, hovered ? 1.0f : 0.90f);
+    ImVec4 currentBg = Lerp4(offBg, onBg, animT);
 
-    // Track
+    // Track (clean Customize-style pill, no heavy frame)
     window->DrawList->AddRectFilled(bb.Min, bb.Max, ImGui::GetColorU32(currentBg), height * 0.5f);
-    window->DrawList->AddRect(bb.Min, bb.Max, ImGui::GetColorU32(hovered ? theme.BorderHover : theme.Border), height * 0.5f, 0, 1.0f);
+    if (hovered) {
+        window->DrawList->AddRect(bb.Min, bb.Max, ImGui::GetColorU32(WithAlpha(theme.AccentHover, 0.45f)), height * 0.5f, 0, 1.0f);
+    }
 
     // Knob
-    const float knobRadius = (height - Sc(6.0f)) * 0.5f;
-    const float knobMinX = bb.Min.x + Sc(3.0f) + knobRadius;
-    const float knobMaxX = bb.Max.x - Sc(3.0f) - knobRadius;
+    const float knobRadius = (height - Sc(4.0f)) * 0.5f;
+    const float knobMinX = bb.Min.x + Sc(2.0f) + knobRadius;
+    const float knobMaxX = bb.Max.x - Sc(2.0f) - knobRadius;
     const float knobX = knobMinX + (knobMaxX - knobMinX) * animT;
     const float knobY = bb.Min.y + height * 0.5f;
 
-    window->DrawList->AddCircleFilled(ImVec2(knobX, knobY), knobRadius, ImColor(255, 255, 255, 255));
+    window->DrawList->AddCircleFilled(ImVec2(knobX, knobY), knobRadius, IM_COL32(255, 255, 255, 255), 20);
 
     return pressed;
 }
@@ -174,16 +189,15 @@ static bool SliderImpl(const char* id, ImGuiDataType type, void* v, const void* 
     const float hv = AnimationEngine::Instance().AnimateFloat(wid, (hovered || active) ? 1.0f : 0.0f, AnimationSpeed::Fast);
     const auto& theme = Theme::Instance().Colors();
     ImDrawList* dl = window->DrawList;
-    const float cy = (track.Min.y + track.Max.y) * 0.5f, th = Sc(5.0f);
+    const float cy = (track.Min.y + track.Max.y) * 0.5f, th = Sc(6.0f);
     const float x0 = track.Min.x + knobR, x1 = track.Max.x - knobR;
     const float kx = std::clamp((grab.Min.x + grab.Max.x) * 0.5f, x0, x1);
-    dl->AddRectFilled(ImVec2(x0 - knobR, cy - th * 0.5f), ImVec2(x1 + knobR, cy + th * 0.5f), ImGui::GetColorU32(ImVec4(1, 1, 1, 0.10f)), th * 0.5f);
-    dl->AddRectFilled(ImVec2(x0 - knobR, cy - th * 0.5f), ImVec2(kx, cy + th * 0.5f), ImGui::GetColorU32(Lerp4(theme.Accent, theme.AccentHover, hv)), th * 0.5f);
-    const float r = knobR * (1.0f + 0.14f * hv);
-    if (hv > 0.01f) dl->AddCircleFilled(ImVec2(kx, cy), r + Sc(5.0f), ImGui::GetColorU32(WithAlpha(theme.Accent, 0.22f * hv)), 24);
-    dl->AddCircleFilled(ImVec2(kx, cy + 1.0f), r + 1.0f, IM_COL32(0, 0, 0, 70), 24);
+    dl->AddRectFilled(ImVec2(x0 - knobR, cy - th * 0.5f), ImVec2(x1 + knobR, cy + th * 0.5f), IM_COL32(255, 255, 255, 34), th * 0.5f);
+    dl->AddRectFilled(ImVec2(x0 - knobR, cy - th * 0.5f), ImVec2(kx, cy + th * 0.5f), ImGui::GetColorU32(WithAlpha(theme.Accent, 0.96f)), th * 0.5f);
+    const float r = knobR * (1.0f + 0.12f * hv);
+    if (hv > 0.01f) dl->AddCircleFilled(ImVec2(kx, cy), r + Sc(6.0f), ImGui::GetColorU32(WithAlpha(theme.AccentHover, 0.28f * hv)), 24);
+    dl->AddCircleFilled(ImVec2(kx, cy + 1.0f), r + 0.5f, IM_COL32(0, 0, 0, 80), 24);
     dl->AddCircleFilled(ImVec2(kx, cy), r, IM_COL32(255, 255, 255, 255), 24);
-    dl->AddCircle(ImVec2(kx, cy), r, ImGui::GetColorU32(WithAlpha(theme.Accent, 0.55f)), 24, 1.2f);
 
     char text[48];
     ImGui::DataTypeFormatString(text, sizeof(text), type, v, fmt);
@@ -349,51 +363,34 @@ void Section(const char* title, const char* description, const std::function<voi
     const auto& theme = Theme::Instance().Colors();
 
     ImGui::Dummy(ImVec2(0.0f, Sc(8.0f)));
-    {   // a short accent bar in front of the title, the description lines up with the title text
-        const ImVec2 tp = ImGui::GetCursorScreenPos();
-        ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(tp.x, tp.y + Sc(2.0f)), ImVec2(tp.x + Sc(3.0f), tp.y + Sc(19.0f)), ImGui::GetColorU32(theme.Accent), Sc(2.0f));
-    }
-    ImGui::Indent(Sc(12.0f));
-    if (FontBold) ImGui::PushFont(FontBold);
-    ImGui::TextColored(theme.TextPrimary, "%s", title);
-    if (FontBold) ImGui::PopFont();
+    // Clean Özelleştir-style locale-aware uppercase section eyebrow directly on the obsidian canvas
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Sc(8.0f), Sc(3.0f)));
+    if (FontSmall) ImGui::PushFont(FontSmall);
+    const std::string upper = ToUpperLocaleUtf8(title);
+    ImGui::TextColored(WithAlpha(theme.AccentHover, 0.92f), "%s", upper.c_str());
     if (description && description[0]) {
-        if (FontSmall) ImGui::PushFont(FontSmall);
         ImGui::TextColored(theme.TextMuted, "%s", description);
-        if (FontSmall) ImGui::PopFont();
     }
-    ImGui::Unindent(Sc(12.0f));
-    ImGui::Dummy(ImVec2(0.0f, Sc(6.0f)));
+    if (FontSmall) ImGui::PopFont();
+    ImGui::PopStyleVar();
+    ImGui::Dummy(ImVec2(0.0f, Sc(4.0f)));
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(theme.Surface.x, theme.Surface.y, theme.Surface.z, 0.74f));    // glass card: the window's light shows through
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 1.0f, 1.0f, 0.085f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, Sc(16.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Sc(22.0f), Sc(4.0f)));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Sc(12.0f), 0.0f));
-
-    char childId[96];
-    snprintf(childId, sizeof(childId), "sec_%s", title);
-    ImGui::BeginChild(childId, ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
     s_firstRow = true;
     content();
-    ImGui::EndChild();
-    ImGui::PopStyleVar(4);
-    ImGui::PopStyleColor(2);
-    ImGui::Dummy(ImVec2(0.0f, Sc(10.0f)));
+    ImGui::Dummy(ImVec2(0.0f, Sc(12.0f)));
 }
 
 void SettingRow(const char* label, const char* description, const std::function<void(float controlWidth)>& renderControl) {
     if (s_capture) { s_capture->push_back({s_captureTab, s_curSection, label ? label : "", description ? description : ""}); return; }
     const auto& theme = Theme::Instance().Colors();
     const float availW = ImGui::GetContentRegionAvail().x;
-    const float controlW = Sc(210.0f);
-    const float labelW = availW - controlW - Sc(28.0f);
-    const float padY = Sc(13.0f);
+    const float controlW = Sc(230.0f);
+    const float labelW = std::max(Sc(140.0f), availW - controlW - Sc(28.0f));
+    const float padY = Sc(11.0f);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 screen = ImGui::GetCursorScreenPos();
-    if (!s_firstRow) dl->AddLine(ImVec2(screen.x, screen.y), ImVec2(screen.x + availW, screen.y), IM_COL32(255, 255, 255, 18), 1.0f);
+    if (!s_firstRow) dl->AddLine(ImVec2(screen.x, screen.y), ImVec2(screen.x + availW, screen.y), IM_COL32(255, 255, 255, 13), 1.0f);
     s_firstRow = false;
 
     const ImVec2 start = ImGui::GetCursorPos();
@@ -409,7 +406,13 @@ void SettingRow(const char* label, const char* description, const std::function<
     ImGui::PopTextWrapPos();
     ImGui::EndGroup();
     const float labelH = ImGui::GetItemRectSize().y;
-    const float rowH = std::max(labelH + padY + padY, Sc(58.0f));
+    const float rowH = std::max(labelH + padY + padY, Sc(50.0f));
+
+    // Subtle Özelleştir row hover highlight directly on the obsidian canvas
+    const ImRect rowRect(ImVec2(screen.x - Sc(10.0f), screen.y + Sc(2.0f)), ImVec2(screen.x + availW + Sc(10.0f), screen.y + rowH - Sc(2.0f)));
+    if (ImGui::IsMouseHoveringRect(rowRect.Min, rowRect.Max, true)) {
+        dl->AddRectFilled(rowRect.Min, rowRect.Max, IM_COL32(255, 255, 255, 11), Sc(10.0f));
+    }
 
     // arrived here from a search result: bring the row into view and flash it
     if (!s_focusLabel.empty() && s_focusLabel == label && s_focusSection == s_curSection) {
@@ -426,10 +429,10 @@ void SettingRow(const char* label, const char* description, const std::function<
 
     if (s_pulse > 0.0f && s_pulseLabel == label && s_pulseSection == s_curSection) {
         const float a = std::min(1.0f, s_pulse) * (0.5f + 0.5f * std::sin(s_pulse * 9.0f));
-        ImVec4 f = theme.Accent; f.w = 0.14f * a;
-        ImVec4 e = theme.Accent; e.w = 0.65f * std::min(1.0f, s_pulse);
-        dl->AddRectFilled(ImVec2(screen.x - Sc(8.0f), screen.y + Sc(2.0f)), ImVec2(screen.x + availW + Sc(8.0f), screen.y + rowH - Sc(2.0f)), ImGui::GetColorU32(f), Sc(10.0f));
-        dl->AddRect(ImVec2(screen.x - Sc(8.0f), screen.y + Sc(2.0f)), ImVec2(screen.x + availW + Sc(8.0f), screen.y + rowH - Sc(2.0f)), ImGui::GetColorU32(e), Sc(10.0f), 0, 1.5f);
+        ImVec4 f = theme.Accent; f.w = 0.16f * a;
+        ImVec4 e = theme.AccentHover; e.w = 0.72f * std::min(1.0f, s_pulse);
+        dl->AddRectFilled(rowRect.Min, rowRect.Max, ImGui::GetColorU32(f), Sc(10.0f));
+        dl->AddRect(rowRect.Min, rowRect.Max, ImGui::GetColorU32(e), Sc(10.0f), 0, 1.4f);
     }
 
     ImGui::SetCursorPos(ImVec2(start.x, start.y + rowH));
@@ -457,40 +460,34 @@ bool SidebarItem(const char* id, const char* label, bool isSelected, float heigh
     const float hov = ae.AnimateFloat(widgetId ^ 0x51ED270Bu, hovered ? 1.0f : 0.0f, AnimationSpeed::Fast);
     const auto& theme = Theme::Instance().Colors();
     ImDrawList* dl = window->DrawList;
-    const float R = Sc(13.0f);
+    const float R = Sc(11.0f);
     auto withA = [](ImVec4 c, float a) { c.w = a; return ImGui::GetColorU32(c); };
 
-    // plate: soft glow + tinted fill + hairline for the selected page, a faint wash while hovering
+    // Exact Özelleştir pill tab: translucent accent fill + crisp 1px accentLight rim when active; soft white wash on hover.
     if (sel > 0.01f) {
-        dl->AddRectFilled(ImVec2(bb.Min.x - Sc(1.0f), bb.Min.y - Sc(1.0f)), ImVec2(bb.Max.x + Sc(1.0f), bb.Max.y + Sc(2.0f)), withA(theme.Accent, 0.07f * sel), R + 2.0f);
-        dl->AddRectFilled(bb.Min, bb.Max, withA(theme.Accent, 0.17f * sel), R);
-        dl->AddRect(bb.Min, bb.Max, withA(theme.Accent, 0.34f * sel), R, 0, 1.0f);
+        dl->AddRectFilled(bb.Min, bb.Max, withA(theme.Accent, 0.34f * sel), R);
+        dl->AddRect(bb.Min, bb.Max, withA(theme.AccentHover, 0.62f * sel), R, 0, 1.0f);
     }
-    if (hov > 0.01f && sel < 0.99f) dl->AddRectFilled(bb.Min, bb.Max, ImGui::GetColorU32(ImVec4(1, 1, 1, 0.055f * hov * (1.0f - sel))), R);
+    if (hov > 0.01f && sel < 0.99f) {
+        dl->AddRectFilled(bb.Min, bb.Max, ImGui::GetColorU32(ImVec4(1, 1, 1, 0.08f * hov * (1.0f - sel))), R);
+    }
 
-    const float shift = Sc(2.0f) * hov * (1.0f - sel);                     // a tiny nudge toward the text while hovering
-    float textX = bb.Min.x + Sc(18.0f) + shift;
+    float textX = bb.Min.x + Sc(14.0f);
     if (iconUtf8 && FontIcons) {
-        const float ts = height - Sc(12.0f);
-        const ImVec2 t0(bb.Min.x + Sc(7.0f) + shift, bb.Min.y + (height - ts) * 0.5f), t1(t0.x + ts, t0.y + ts);
-        const float tr = Sc(10.0f);
-        if (sel > 0.01f) dl->AddRectFilled(ImVec2(t0.x - Sc(3.0f), t0.y - Sc(2.0f)), ImVec2(t1.x + Sc(3.0f), t1.y + Sc(4.0f)), withA(theme.Accent, 0.22f * sel), tr + 3.0f);
-        const ImVec4 idle(1.0f, 1.0f, 1.0f, 0.05f + 0.05f * hov);
-        const ImVec4 fill = ImLerp(idle, ImVec4(theme.Accent.x, theme.Accent.y, theme.Accent.z, 0.96f), sel);
-        dl->AddRectFilled(t0, t1, ImGui::GetColorU32(fill), tr);
-        if (sel > 0.01f) dl->AddRectFilled(t0, ImVec2(t1.x, t0.y + ts * 0.5f), ImGui::GetColorU32(ImVec4(1, 1, 1, 0.18f * sel)), tr, ImDrawFlags_RoundCornersTop);
         ImGui::PushFont(FontIcons);
         const ImVec2 isz = ImGui::CalcTextSize(iconUtf8);
-        const ImVec4 icIdle = ImLerp(theme.TextMuted, theme.TextSecondary, hov);
+        const ImVec4 icIdle = ImLerp(theme.TextSecondary, theme.TextPrimary, hov);
         const ImVec4 ic = ImLerp(icIdle, ImVec4(1, 1, 1, 1), sel);
-        dl->AddText(ImVec2(t0.x + (ts - isz.x) * 0.5f, t0.y + (ts - isz.y) * 0.5f), ImGui::GetColorU32(ic), iconUtf8);
+        dl->AddText(ImVec2(bb.Min.x + Sc(12.0f) + (Sc(22.0f) - isz.x) * 0.5f, bb.Min.y + (height - isz.y) * 0.5f), ImGui::GetColorU32(ic), iconUtf8);
         ImGui::PopFont();
-        textX = t1.x + Sc(12.0f);
+        textX = bb.Min.x + Sc(44.0f);
     }
-    const ImVec4 textIdle = ImLerp(theme.TextMuted, theme.TextSecondary, hov);
-    const ImVec4 textCol = ImLerp(textIdle, theme.TextPrimary, sel);
+    if (isSelected && FontBold) ImGui::PushFont(FontBold);
+    const ImVec4 textIdle = ImLerp(theme.TextSecondary, theme.TextPrimary, hov);
+    const ImVec4 textCol = ImLerp(textIdle, ImVec4(1, 1, 1, 1), sel);
     const ImVec2 textPos(textX, bb.Min.y + (height - ImGui::GetFontSize()) * 0.5f);
     dl->AddText(textPos, ImGui::GetColorU32(textCol), label);
+    if (isSelected && FontBold) ImGui::PopFont();
     return pressed;
 }
 
