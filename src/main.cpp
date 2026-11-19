@@ -8,6 +8,7 @@
 #pragma comment(lib, "winmm.lib")
 #include "aether/core/log.hpp"
 #include "aether/core/crash.hpp"
+#include "aether/core/single_instance.hpp"
 #include "aether/core/timer.hpp"
 #include "aether/core/frame_recorder.hpp"
 #include "aether/core/i18n.hpp"
@@ -44,13 +45,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     // A recording (--record) takes over instead: it asks the running copy to quit, records, then starts a normal copy again.
     const bool recordRun = core::ParseRecordArgs().on;
     bool tookOver = false;
-    HANDLE quitEvt = CreateEventW(nullptr, TRUE, FALSE, L"Local\\AetherMainQuit");
+    core::OpenAcl acl;   // open DACL: a copy that runs elevated and one that does not can still find each other's events / mutex
+    HANDLE quitEvt = CreateEventW(acl.Get(), TRUE, FALSE, L"Local\\AetherMainQuit");
     // "--settings [desktop]" from another program (the desktop's Aether icon, a shortcut): the running copy opens its Settings Center
-    HANDLE settingsEvt = CreateEventW(nullptr, FALSE, FALSE, L"Local\\AetherShowSettings");
-    HANDLE settingsDeskEvt = CreateEventW(nullptr, FALSE, FALSE, L"Local\\AetherShowSettingsDesktop");
+    HANDLE settingsEvt = CreateEventW(acl.Get(), FALSE, FALSE, L"Local\\AetherShowSettings");
+    HANDLE settingsDeskEvt = CreateEventW(acl.Get(), FALSE, FALSE, L"Local\\AetherShowSettingsDesktop");
     const bool wantSettings = wcsstr(GetCommandLineW(), L"--settings") != nullptr;
     const bool wantDesktopPage = wantSettings && wcsstr(GetCommandLineW(), L"desktop") != nullptr;
-    HANDLE once = CreateMutexW(nullptr, FALSE, L"Local\\AetherMainInstance");
+    HANDLE once = CreateMutexW(acl.Get(), FALSE, L"Local\\AetherMainInstance");
     {
         const bool exists = GetLastError() == ERROR_ALREADY_EXISTS;
         if (exists) {

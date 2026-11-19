@@ -20,6 +20,8 @@
 #include "aether/core/monitors.hpp"
 #include "aether/system/shell_keys.hpp"
 #include "aether/core/crash.hpp"
+#include "aether/core/single_instance.hpp"
+#include "aether/system/bar_task.hpp"
 #include <atomic>
 
 using namespace aether::bar;
@@ -249,8 +251,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
         return 0;
     }
 
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Aether.Bar.SingleInstance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    HANDLE mutex = nullptr;
+    if (!aether::core::AcquireSingleInstance(L"Aether.Bar.SingleInstance", &mutex)) return 0;
+
+    // The logon task that starts this (elevated) exe remembers a path. After a reinstall / another build folder it still starts the old copy,
+    // or nothing. AetherShell notices that and starts this copy with --repair-task; it has the rights to fix the task. Only on that request
+    // (a copy started by hand from a build folder must not steal the task) and only when the user has the task at all.
+    if (cmdLine && wcsstr(cmdLine, L"--repair-task")) {
+        wchar_t self[MAX_PATH] = {};
+        if (GetModuleFileNameW(nullptr, self, MAX_PATH) && aether::system::bartask::Exists() && !aether::system::bartask::RunsExe(self))
+            aether::system::bartask::Repair(self);
+    }
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     aether::core::InstallCrashHandler(L"AetherBar");

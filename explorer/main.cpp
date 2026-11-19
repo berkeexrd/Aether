@@ -41,6 +41,7 @@
 #include "archive.hpp"
 #include "netfs.hpp"
 #include "aether/core/crash.hpp"
+#include "aether/core/single_instance.hpp"
 
 #ifndef DWMWA_WINDOW_CORNER_PREFERENCE
 #define DWMWA_WINDOW_CORNER_PREFERENCE 33
@@ -66,17 +67,51 @@ constexpr const wchar_t* kRepoUrl = L"https://github.com/berkeexrd/Aether";
 constexpr const wchar_t* kDonateUrl = L"https://github.com/berkeexrd/Aether";   // bağış sayfası adresini buraya yaz (GitHub Sponsors, Ko-fi, Buy Me a Coffee...)
 constexpr UINT kMsgXfer = WM_APP + 7;     // lParam = new std::wstring (status text; empty clears)
 constexpr UINT kMsgNav = WM_APP + 8;      // lParam = new std::wstring (path to open)
+constexpr UINT kMsgOpenExt = WM_APP + 9;  // lParam = new std::wstring (a folder another launch asked for; may be empty = just show the window)
 constexpr UINT kMsgThumb = WM_APP + 4;    // lParam = ThumbResult*
 constexpr UINT kMsgInfo  = WM_APP + 5;    // lParam = InfoResult*
 constexpr UINT kMsgOpDone = WM_APP + 3;   // wParam = 1: select + rename lParam (wchar_t* heap string, may be null)
-constexpr UINT_PTR kTimerCaret = 2, kTimerRefresh = 3;
+constexpr UINT_PTR kTimerCaret = 2, kTimerRefresh = 3, kTimerJob = 30;
+// A second AetherExplorer.exe hands its folder to the running window as WM_COPYDATA (dwData = this value, lpData = UTF-16 path)
+constexpr ULONG_PTR kOpenPathMagic = 0x41455850;
+constexpr wchar_t kWindowClass[] = L"AetherExplorerWindow";
+constexpr wchar_t kInstanceMutex[] = L"Local\\AetherExplorerSingleInstance";
 
 constexpr float kTitleH = 44.0f, kSideW = 236.0f, kToolbarH = 60.0f, kRowH = 38.0f, kHeadH = 34.0f, kCmdH = 44.0f, kStatusH = 30.0f;
 
-inline void PostXfer(HWND h, const std::wstring& t) {
+// busy = work is going on (a moving bar in the progress card); false = a final message (an error), shown for a few seconds
+inline void PostXfer(HWND h, const std::wstring& t, bool busy = true) {
     if (!IsWindow(h)) return;
     auto* p = new std::wstring(t);
-    if (!PostMessageW(h, kMsgXfer, 0, reinterpret_cast<LPARAM>(p))) delete p;
+    if (!PostMessageW(h, kMsgXfer, busy ? 1 : 0, reinterpret_cast<LPARAM>(p))) delete p;
+}
+
+// ---- jobs: copy / move / delete run on a worker thread, the window shows them as progress cards ----------------------
+constexpr UINT kMsgJob = WM_APP + 10;     // a job changed: repaint (no data)
+struct JobState {
+    std::mutex mu;
+    std::wstring title, detail;
+    float frac{-1.0f};                    // < 0: not known (moving bar)
+    bool done{false}, ok{true}, cancelled{false};
+    ULONGLONG startTick{GetTickCount64()}, doneTick{0};
+};
+using JobPtr = std::shared_ptr<JobState>;
+struct JobList { std::mutex mu; std::vector<JobPtr> v; };
+inline JobList& Jobs() { static JobList j; return j; }
+inline JobPtr NewJob(HWND h, const std::wstring& title) {
+    auto j = std::make_shared<JobState>();
+    j->title = title;
+    { std::lock_guard<std::mutex> g(Jobs().mu); Jobs().v.push_back(j); }
+    if (IsWindow(h)) PostMessageW(h, kMsgJob, 0, 0);
+    return j;
+}
+inline void JobUpdate(const JobPtr& j, HWND h, const std::wstring* detail, float frac) {
+    { std::lock_guard<std::mutex> g(j->mu); if (detail) j->detail = *detail; if (frac >= -1.0f) j->frac = frac; }
+    if (IsWindow(h)) PostMessageW(h, kMsgJob, 0, 0);
+}
+inline void JobFinish(const JobPtr& j, HWND h, bool ok, bool cancelled = false) {
+    { std::lock_guard<std::mutex> g(j->mu); j->done = true; j->ok = ok; j->cancelled = cancelled; j->frac = 1.0f; j->doneTick = GetTickCount64(); }
+    if (IsWindow(h)) PostMessageW(h, kMsgJob, 0, 0);
 }
 inline void PostNav(HWND h, const std::wstring& t) {
     if (!IsWindow(h)) return;
@@ -175,12 +210,60 @@ std::wstring UniqueName(const std::wstring& dir, const std::wstring& base, const
 // ---- file operations (IFileOperation = the shell's own engine: progress UI, undo, recycle bin, conflict dialogs) ----
 enum class Op { Copy, Move, Delete, DeletePerm, Rename };
 
+// Reports the shell engine's progress to a job card: the item being worked on and the overall fraction.
+class OpSink : public IFileOperationProgressSink {
+public:
+    OpSink(JobPtr job, HWND hwnd) : m_job(std::move(job)), m_hwnd(hwnd) {}
+    HRESULT __stdcall QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IFileOperationProgressSink) { *ppv = static_cast<IFileOperationProgressSink*>(this); AddRef(); return S_OK; }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG __stdcall AddRef() override { return InterlockedIncrement(&m_ref); }
+    ULONG __stdcall Release() override { const LONG r = InterlockedDecrement(&m_ref); if (!r) delete this; return r; }
+    HRESULT __stdcall StartOperations() override { return S_OK; }
+    HRESULT __stdcall FinishOperations(HRESULT) override { return S_OK; }
+    HRESULT __stdcall PreRenameItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
+    HRESULT __stdcall PostRenameItem(DWORD, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT __stdcall PreMoveItem(DWORD, IShellItem* i, IShellItem*, LPCWSTR) override { Name(i); return S_OK; }
+    HRESULT __stdcall PostMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT __stdcall PreCopyItem(DWORD, IShellItem* i, IShellItem*, LPCWSTR) override { Name(i); return S_OK; }
+    HRESULT __stdcall PostCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT __stdcall PreDeleteItem(DWORD, IShellItem* i) override { Name(i); return S_OK; }
+    HRESULT __stdcall PostDeleteItem(DWORD, IShellItem*, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT __stdcall PreNewItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
+    HRESULT __stdcall PostNewItem(DWORD, IShellItem*, LPCWSTR, LPCWSTR, DWORD, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT __stdcall UpdateProgress(UINT total, UINT sofar) override {
+        if (total > 0) JobUpdate(m_job, m_hwnd, nullptr, std::clamp(static_cast<float>(static_cast<double>(sofar) / total), 0.0f, 1.0f));
+        return S_OK;
+    }
+    HRESULT __stdcall ResetTimer() override { return S_OK; }
+    HRESULT __stdcall PauseTimer() override { return S_OK; }
+    HRESULT __stdcall ResumeTimer() override { return S_OK; }
+private:
+    void Name(IShellItem* i) {
+        PWSTR n = nullptr;
+        if (i && SUCCEEDED(i->GetDisplayName(SIGDN_NORMALDISPLAY, &n)) && n) { const std::wstring s = n; JobUpdate(m_job, m_hwnd, &s, -2.0f); CoTaskMemFree(n); }
+    }
+    LONG m_ref{1};
+    JobPtr m_job;
+    HWND m_hwnd;
+};
+
 void RunFileOp(HWND owner, Op op, std::vector<std::wstring> src, std::wstring dest, std::wstring newName, std::wstring selectAfter) {
+    JobPtr job;
+    if (op != Op::Rename && !src.empty()) {
+        const std::wstring cnt = src.size() == 1 ? L"" : L" · " + std::to_wstring(src.size()) + L" öğe";
+        const wchar_t* verb = op == Op::Copy ? L"Kopyalanıyor" : op == Op::Move ? L"Taşınıyor" : op == Op::DeletePerm ? L"Kalıcı olarak siliniyor" : L"Siliniyor";
+        job = NewJob(owner, verb + cnt);
+    }
     ::aether::core::SafeThread("bg", [=]() {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        bool opOk = false, opAborted = false;
         {
             ComPtr<IFileOperation> fo;
             if (SUCCEEDED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&fo)))) {
+                DWORD cookie = 0; bool advised = false;
+                if (job) { ComPtr<IFileOperationProgressSink> sink; sink.Attach(new OpSink(job, owner)); advised = SUCCEEDED(fo->Advise(sink.Get(), &cookie)); }
                 fo->SetOwnerWindow(owner);
                 if (op == Op::DeletePerm) fo->SetOperationFlags(FOF_NOCONFIRMMKDIR);
                 else fo->SetOperationFlags(FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOFX_RECYCLEONDELETE);
@@ -196,9 +279,14 @@ void RunFileOp(HWND owner, Op op, std::vector<std::wstring> src, std::wstring de
                         case Op::Rename: fo->RenameItem(it.Get(), newName.c_str(), nullptr); break;
                     }
                 }
-                fo->PerformOperations();
+                const HRESULT hr = fo->PerformOperations();
+                BOOL aborted = FALSE; fo->GetAnyOperationsAborted(&aborted);
+                opAborted = aborted != FALSE;                     // the user pressed Cancel / Skip in the shell's dialog
+                opOk = SUCCEEDED(hr) && !aborted;
+                if (advised) fo->Unadvise(cookie);
             }
         }
+        if (job) JobFinish(job, owner, opOk, opAborted);
         CoUninitialize();
         if (IsWindow(owner)) {
             wchar_t* sel = nullptr;
@@ -370,6 +458,7 @@ public:
     HWND Hwnd() const { return m_hwnd; }
     bool NeedsFrame() const { return m_dirty || m_animating; }
     void Frame();
+    void OpenExternal(const std::wstring& path);   // another launch asked for this folder: reuse this window (new tab / existing tab)
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -467,6 +556,7 @@ private:
     std::wstring TabTitle(const std::wstring& p) const;
     void DrawTabs(float W);
     void DrawAbout(float W, float H);
+    void DrawJobs(float W, float H);
     void GlowRR(const Rect& r, float rad, const Color& c, float spread, float strength);
     bool m_about{false};
     // helpers
@@ -565,6 +655,9 @@ private:
     std::vector<std::wstring> m_pins;
     std::vector<Conn> m_conns;
     std::wstring m_xfer;
+    bool m_jobTimer{false};                 // the 25 fps repaint timer of the progress cards is running
+    bool m_xferBusy{false};                 // m_xfer describes running work (moving bar) rather than a final message
+    ULONGLONG m_xferTick{0};
     std::vector<std::wstring> m_ftpClip;
     bool m_ftpClipCut{false};
     DWORD m_ftpClipSeq{0};
@@ -659,7 +752,7 @@ bool Explorer::Create(HINSTANCE inst, const std::wstring& startPath) {
     wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
-    wc.lpszClassName = L"AetherExplorerWindow";
+    wc.lpszClassName = kWindowClass;
     wc.hCursor = nullptr;
     wc.hIcon = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
     wc.hIconSm = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
@@ -678,6 +771,7 @@ bool Explorer::Create(HINSTANCE inst, const std::wstring& startPath) {
                              WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN,
                              x, y, w, h, nullptr, nullptr, inst, this);
     if (!m_hwnd) return false;
+    ChangeWindowMessageFilterEx(m_hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);   // also from a launcher of a different integrity level
 
     DWORD corner = 2;                                // DWMWCP_ROUND
     DwmSetWindowAttribute(m_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
@@ -912,9 +1006,25 @@ LRESULT Explorer::Handle(UINT m, WPARAM w, LPARAM l) {
     }
     case WM_KEYDOWN: OnKey(w); return 0;
     case WM_CHAR: OnChar(static_cast<wchar_t>(w)); return 0;
+    case WM_COPYDATA: {
+        const auto* cds = reinterpret_cast<const COPYDATASTRUCT*>(l);
+        if (!cds || cds->dwData != kOpenPathMagic) break;
+        std::wstring p;
+        if (cds->lpData && cds->cbData >= sizeof(wchar_t) && cds->cbData <= 65536) {
+            p.assign(static_cast<const wchar_t*>(cds->lpData), cds->cbData / sizeof(wchar_t));
+            p.resize(wcsnlen(p.c_str(), p.size()));
+        }
+        // Only queue it: this runs inside the other process' SendMessage, possibly while Create is still building the window, and a
+        // slow open (FTP login prompt) would make the sender time out and send again. The message loop picks it up once we are ready.
+        auto* q = new std::wstring(std::move(p));
+        if (!PostMessageW(m_hwnd, kMsgOpenExt, 0, reinterpret_cast<LPARAM>(q))) { delete q; return FALSE; }
+        return TRUE;
+    }
+    case kMsgOpenExt: { auto* t = reinterpret_cast<std::wstring*>(l); const std::wstring p = *t; delete t; OpenExternal(p); return 0; }
     case kMsgFolder: OnFolderResult(reinterpret_cast<FolderResult*>(l)); return 0;
     case kMsgHome: OnHomeResult(reinterpret_cast<HomeData*>(l)); return 0;
-    case kMsgXfer: { auto* t = reinterpret_cast<std::wstring*>(l); m_xfer = *t; delete t; Kick(); return 0; }
+    case kMsgXfer: { auto* t = reinterpret_cast<std::wstring*>(l); m_xfer = *t; delete t; m_xferBusy = w != 0; m_xferTick = GetTickCount64(); Kick(); return 0; }
+    case kMsgJob: Kick(); return 0;
     case kMsgNav: { auto* t = reinterpret_cast<std::wstring*>(l); const std::wstring p = *t; delete t; Navigate(p); return 0; }
     case kMsgThumb: OnThumb(reinterpret_cast<ThumbResult*>(l)); return 0;
     case kMsgInfo: OnInfo(reinterpret_cast<InfoResult*>(l)); return 0;
@@ -932,7 +1042,7 @@ LRESULT Explorer::Handle(UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_TIMER:
-        if (w == kTimerCaret) { Kick(); }
+        if (w == kTimerCaret || w == kTimerJob) { Kick(); }
         else if (w == kTimerRefresh + 10) { KillTimer(m_hwnd, kTimerRefresh + 10); if (!m_home && !m_deep && !m_loading) Refresh(); }
         else if (w == kTimerRefresh) {
             if (render::glass::SyncTheme()) { m_fmts.clear(); Kick(); }
@@ -980,6 +1090,29 @@ void Explorer::Tick() {
     if (std::fabs(m_scrollTarget - m_scroll) > 0.4f && !m_dragScroll) { m_scroll = Ease(m_scroll, m_scrollTarget, dt, 20.0f); anim = true; }
     else if (!m_dragScroll) m_scroll = m_scrollTarget;
     if (m_loading || m_needRedrawForIcons) anim = true;
+    {   // progress cards: finished ones disappear after a moment; running ones repaint on a 25 fps timer, not on every vsync
+        bool busy = false;
+        const ULONGLONG t = GetTickCount64();
+        std::lock_guard<std::mutex> g(Jobs().mu);
+        auto& v = Jobs().v;
+        for (size_t i = 0; i < v.size();) {
+            const JobPtr jp = v[i];                         // keeps the state alive while its lock is held and the entry is erased
+            bool drop = false;
+            {
+                std::lock_guard<std::mutex> gj(jp->mu);
+                const bool shown = t - jp->startTick >= 400;       // a job that was over before it was ever drawn never shows
+                drop = jp->done && (!shown || t - jp->doneTick > (jp->ok ? 1800u : 5000u));
+            }
+            if (drop) { v.erase(v.begin() + i); continue; }
+            ++i; busy = true;
+        }
+        if (!m_xfer.empty()) {
+            if (!m_xferBusy && t - m_xferTick > 6000) m_xfer.clear();   // an error message does not stay forever
+            else busy = true;
+        }
+        if (busy && !m_jobTimer) { SetTimer(m_hwnd, kTimerJob, 40, nullptr); m_jobTimer = true; }
+        else if (!busy && m_jobTimer) { KillTimer(m_hwnd, kTimerJob); m_jobTimer = false; m_dirty = true; }
+    }
     m_animating = anim;
 }
 
@@ -1550,7 +1683,7 @@ void Explorer::Compress(int kind) {
     ::aether::core::SafeThread("bg", [=]() {
         PostXfer(hwnd, L"Sıkıştırılıyor: " + out);
         const bool ok = CompressTo(kind, dir, names, JoinPath(dir, out));
-        PostXfer(hwnd, ok ? L"" : (kind == 1 ? L"Sıkıştırılamadı (7-Zip gerekli)" : L"Sıkıştırılamadı"));
+        PostXfer(hwnd, ok ? L"" : (kind == 1 ? L"Sıkıştırılamadı (7-Zip gerekli)" : L"Sıkıştırılamadı"), false);
         PostOpDone(hwnd, ok ? out : L"");
     }).detach();
 }
@@ -1581,7 +1714,7 @@ void Explorer::Upload() {
         if (!files.empty() && IsWindow(hwnd)) {
             if (IsFtp(dir)) {
                 const bool ok = TransferItems(files, dir, false, [hwnd](const std::wstring& t) { PostXfer(hwnd, t); });
-                PostXfer(hwnd, ok ? L"" : L"Bazı dosyalar yüklenemedi");
+                PostXfer(hwnd, ok ? L"" : L"Bazı dosyalar yüklenemedi", false);
                 PostOpDone(hwnd, L"");
             } else RunFileOp(hwnd, Op::Copy, files, dir, L"", L"");
         }
@@ -2238,7 +2371,7 @@ void Explorer::StartTransfer(std::vector<std::wstring> srcs, std::wstring dest, 
     const HWND hwnd = m_hwnd;
     ::aether::core::SafeThread("bg", [=]() {
         const bool ok = TransferItems(srcs, dest, move, [hwnd](const std::wstring& t) { PostXfer(hwnd, t); });
-        PostXfer(hwnd, ok ? L"" : L"Bazı öğeler aktarılamadı");
+        PostXfer(hwnd, ok ? L"" : L"Bazı öğeler aktarılamadı", false);
         PostOpDone(hwnd, L"");
     }).detach();
 }
@@ -2247,7 +2380,7 @@ void Explorer::RemoteOp(const std::wstring& anyUrl, std::function<bool(FtpClient
     ::aether::core::SafeThread("bg", [=]() {
         FtpClient c;
         const bool ok = c.Open(anyUrl) && fn(c);
-        PostXfer(hwnd, ok ? L"" : L"İşlem sunucuda başarısız oldu");
+        PostXfer(hwnd, ok ? L"" : L"İşlem sunucuda başarısız oldu", false);
         PostOpDone(hwnd, ok ? sel : L"");
     }).detach();
 }
@@ -2263,7 +2396,7 @@ void Explorer::OpenRemoteFile(const std::wstring& url) {
         const std::wstring local = JoinPath(dir, leaf);
         FtpClient c;
         const bool ok = c.Open(url) && c.Get(ParseFtp(url).path, local);
-        PostXfer(hwnd, ok ? L"" : L"İndirilemedi: " + leaf);
+        PostXfer(hwnd, ok ? L"" : L"İndirilemedi: " + leaf, false);
         if (ok) ShellExecuteW(hwnd, L"open", local.c_str(), nullptr, dir.c_str(), SW_SHOWNORMAL);
     }).detach();
 }
@@ -2300,11 +2433,11 @@ void Explorer::BrowseArchive(const std::wstring& arc) {
                 SHFILEOPSTRUCTW op{}; op.wFunc = FO_DELETE; op.pFrom = d2.c_str(); op.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
                 SHFileOperationW(&op);
                 PostXfer(hwnd, tool.empty() ? L"Arşiv açılamadı: uygun araç bulunamadı (7-Zip veya WinRAR kurun)"
-                                            : L"Arşiv açılamadı (" + tool + L"). RAR/7z için 7-Zip veya WinRAR kurulu olmalı.");
+                                            : L"Arşiv açılamadı (" + tool + L"). RAR/7z için 7-Zip veya WinRAR kurulu olmalı.", false);
                 return;
             }
         }
-        PostXfer(hwnd, L"Arşiv içeriği (geçici, salt okunur kopya)");
+        PostXfer(hwnd, L"Arşiv içeriği (geçici, salt okunur kopya)", false);
         PostNav(hwnd, dir);
     }).detach();
 }
@@ -2319,7 +2452,7 @@ void Explorer::ExtractArchiveCmd(const std::wstring& arc, bool intoFolder) {
         PostXfer(hwnd, L"Çıkarılıyor: " + LeafOf(arc));
         std::wstring tool;
         const bool ok = ExtractArchive(arc, dest, tool);
-        PostXfer(hwnd, ok ? L"" : L"Çıkarılamadı" + (tool.empty() ? std::wstring(L": uygun araç yok") : L" (" + tool + L"). RAR/7z için 7-Zip veya WinRAR gerekebilir."));
+        PostXfer(hwnd, ok ? L"" : L"Çıkarılamadı" + (tool.empty() ? std::wstring(L": uygun araç yok") : L" (" + tool + L"). RAR/7z için 7-Zip veya WinRAR gerekebilir."), false);
         PostOpDone(hwnd, ok ? folder : L"");
     }).detach();
 }
@@ -2376,6 +2509,31 @@ void Explorer::CloseTab(int i) {
         Navigate(t.path, false);
         m_scrollTarget = m_scroll = t.scroll;
     }
+    Kick();
+}
+
+void Explorer::OpenExternal(const std::wstring& path) {
+    if (IsIconic(m_hwnd)) ShowWindow(m_hwnd, SW_RESTORE);
+    else if (!IsWindowVisible(m_hwnd)) ShowWindow(m_hwnd, SW_SHOW);
+
+    if (!path.empty()) {
+        const std::wstring want = NormalizeFsPath(path);
+        SaveTab();
+        int found = -1;
+        for (int i = 0; i < static_cast<int>(m_tabs.size()); ++i) if (IEquals(NormalizeFsPath(m_tabs[i].path), want)) { found = i; break; }
+        if (found >= 0) SwitchTab(found);
+        else if (m_tabs.size() < 24) NewTab(want);
+        else Navigate(want);
+    }
+
+    // the launcher called AllowSetForegroundWindow for us; the thread-input attach covers the cases where it could not
+    const DWORD me = GetCurrentThreadId();
+    HWND fg = GetForegroundWindow();
+    const DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    const bool attached = fgThread && fgThread != me && AttachThreadInput(me, fgThread, TRUE);
+    BringWindowToTop(m_hwnd);
+    SetForegroundWindow(m_hwnd);
+    if (attached) AttachThreadInput(me, fgThread, FALSE);
     Kick();
 }
 
@@ -2836,6 +2994,7 @@ void Explorer::Render() {
     DrawSidebar(H);
     DrawToolbar(W);
     DrawTitleBar(W);
+    DrawJobs(W, H);
     if (m_about) DrawAbout(W, H);
 
     m_ctx->SetTransform(D2D1::Matrix3x2F::Identity());
@@ -2853,6 +3012,64 @@ void Explorer::GlowRR(const Rect& r, float rad, const Color& c, float spread, fl
         const float a = strength * (1.0f - t) * (1.0f - t) * 0.30f;
         if (a < 0.004f) continue;
         StrokeRR(Rect{r.x - grow, r.y - grow, r.width + 2 * grow, r.height + 2 * grow}, rad + grow, WithA(c, a), spread / N * 1.9f);
+    }
+}
+
+// Progress cards in the bottom-right corner: copy / move / delete show the file and a percentage, archive work and transfers a moving bar.
+void Explorer::DrawJobs(float W, float H) {
+    struct Card { std::wstring title, detail; float frac; bool done, ok, cancelled; };
+    std::vector<Card> cards;
+    const ULONGLONG t = GetTickCount64();
+    {
+        std::lock_guard<std::mutex> g(Jobs().mu);
+        for (const auto& jp : Jobs().v) {
+            std::lock_guard<std::mutex> gj(jp->mu);
+            if (t - jp->startTick < 400) continue;                       // short operations do not flash a card
+            cards.push_back({jp->title, jp->detail, jp->frac, jp->done, jp->ok, jp->cancelled});
+        }
+    }
+    if (!m_xfer.empty()) {
+        // "Sıkıştırılıyor: x.zip" -> title "Sıkıştırılıyor", detail "x.zip"
+        const size_t c = m_xfer.find(L": ");
+        Card k{c == std::wstring::npos ? m_xfer : m_xfer.substr(0, c), c == std::wstring::npos ? L"" : m_xfer.substr(c + 2), -1.0f, !m_xferBusy, false, false};
+        cards.push_back(k);
+    }
+    if (cards.empty()) return;
+    const Color vl = render::glass::kVioletLight, muted = render::glass::kMuted;
+    m_clip = Rect{0, 0, W, H};
+    const float cw = 340.0f, ch = 66.0f, gap = 10.0f;
+    float y = H - kStatusH - 14.0f - ch;
+    const float x = W - cw - 22.0f;
+    const int n = static_cast<int>(std::min<size_t>(cards.size(), 3));
+    for (int i = 0; i < n; ++i, y -= ch + gap) {
+        const Card& c = cards[i];
+        const Rect r{x, y, cw, ch};
+        const Color warn{1.0f, 0.55f, 0.55f, 1.0f}, good{0.45f, 0.92f, 0.62f, 1.0f};
+        const bool failed = c.done && !c.ok && !c.cancelled && c.frac >= 0.0f;        // a job that ended badly (m_xfer finals have frac < 0)
+        const bool finalMsg = c.done && c.frac < 0.0f;                                  // a message from an archive / transfer worker
+        GlowRR(r, 16, vl, 10.0f, 0.5f);
+        FillRR(r, 16, Color{0.05f, 0.03f, 0.11f, 0.94f});
+        StrokeRR(r, 16, WithA(vl, 0.45f), 1.0f);
+        const Color accent = (failed || finalMsg) ? warn : (c.done ? good : vl);
+        Glyph(finalMsg || failed ? 0xE783 : (c.cancelled ? 0xE711 : (c.done ? 0xE73E : 0xE896)), Rect{r.x + 12, r.y + 10, 24, 24}, 15.0f, accent);   // error / cancel / check / download
+        std::wstring title = c.title;
+        if (c.done && !finalMsg) title = c.cancelled ? L"İptal edildi" : failed ? L"İşlem tamamlanamadı" : L"Tamamlandı";
+        Txt(title, Rect{r.x + 44, r.y + 8, cw - 60 - (c.frac >= 0 && !c.done ? 44.0f : 0.0f), 22}, 13.5f, 600, kWhite);
+        if (c.frac >= 0.0f && !c.done) {
+            wchar_t pct[16]; swprintf(pct, 16, L"%d%%", static_cast<int>(std::lround(c.frac * 100.0f)));
+            Txt(pct, Rect{r.Right() - 58, r.y + 8, 46, 22}, 13.0f, 600, Mix(vl, kWhite, 0.4f), 2);
+        }
+        if (!c.detail.empty() && !c.done) Txt(c.detail, Rect{r.x + 44, r.y + 29, cw - 60, 18}, 12.0f, 400, muted);
+        const Rect bar{r.x + 44, r.y + ch - 18, cw - 60, 6};
+        if (c.done) { if (!finalMsg && !failed && !c.cancelled) ProgressBar(bar, 1.0f, false); }
+        else if (c.frac >= 0.0f) ProgressBar(bar, c.frac, false);
+        else {                                                                          // unknown length: a bar that slides back and forth
+            FillRR(bar, 3, Color{1.0f, 1.0f, 1.0f, 0.085f});
+            const float ph = (std::sin(static_cast<float>(t % 1600) / 1600.0f * 6.2831853f - 1.5707963f) * 0.5f + 0.5f);
+            const float segW = bar.width * 0.34f;
+            const Rect seg{bar.x + (bar.width - segW) * ph, bar.y, segW, bar.height};
+            FillRR(seg, 3, Color{0.60f, 0.26f, 0.98f, 1.0f});
+        }
     }
 }
 
@@ -3778,20 +3995,61 @@ void Explorer::DrawFolder(float W, float H) {
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
+// Hands `path` to an Explorer window that is already running. Returns false when there is none that answers.
+static bool ForwardToRunningWindow(const std::wstring& path) {
+    HWND h = FindWindowW(kWindowClass, nullptr);
+    if (!h) return false;
+    DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+    if (pid) AllowSetForegroundWindow(pid);                          // we were just launched by the user: lend that right to the window
+    COPYDATASTRUCT cds = {};
+    cds.dwData = kOpenPathMagic;
+    cds.cbData = static_cast<DWORD>((path.size() + 1) * sizeof(wchar_t));
+    cds.lpData = const_cast<wchar_t*>(path.c_str());
+    DWORD_PTR res = 0;
+    return SendMessageTimeoutW(h, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds), SMTO_ABORTIFHUNG | SMTO_NORMAL, 5000, &res) != 0 && res != 0;
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     aether::core::InstallCrashHandler(L"AetherExplorer");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // AetherExplorer.exe [path] : open a folder directly (a file opens its folder)
+    std::wstring start;
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv) {
+            for (int i = 1; i < argc; ++i) { if (i > 1) start += L' '; start += argv[i]; }   // an unquoted path with spaces arrives as several arguments
+            LocalFree(argv);
+        }
+        start = NormalizeFsPath(start);
+        if (!start.empty() && !IsVirtualPath(start)) {
+            const DWORD a = GetFileAttributesW(start.c_str());
+            if (a == INVALID_FILE_ATTRIBUTES) start.clear();
+            else if (!(a & FILE_ATTRIBUTE_DIRECTORY)) {                         // a file: show the folder it lives in
+                const size_t k = start.find_last_of(L'\\');
+                start = NormalizeFsPath(k == std::wstring::npos ? L"" : start.substr(0, k + 1 == 3 ? 3 : k));
+            }
+        }
+    }
+
+    // One Explorer window, like Windows' own: a second launch (a folder opened from the desktop, the Run box, a "Open" verb,
+    // a double click racing the first one) opens its folder as a tab in the running window instead of stacking a new process.
+    // The mutex is created before anything else so two simultaneous launches cannot both think they are first.
+    HANDLE once = nullptr;
+    if (!aether::core::AcquireSingleInstance(kInstanceMutex, &once)) {
+        // the first launch may not have created its window yet: wait for it, but never forever
+        const ULONGLONG deadline = GetTickCount64() + 6000;
+        do {
+            if (ForwardToRunningWindow(start)) return 0;
+            Sleep(60);
+        } while (GetTickCount64() < deadline);
+        // nothing answered (the other copy died or hangs): carry on as a normal window
+    }
+
     SetCurrentProcessExplicitAppUserModelID(L"Aether.Explorer");     // own taskbar identity + icon
     OleInitialize(nullptr);
     render::glass::SyncTheme();
-
-    // AetherExplorer.exe [path] : open a folder directly
-    std::wstring start;
-    if (cmdLine && *cmdLine) {
-        start = cmdLine;
-        if (start.size() > 1 && start.front() == L'"') { start.erase(0, 1); const size_t q = start.find(L'"'); if (q != std::wstring::npos) start.erase(q); }
-        if (!aether::explorer::IsVirtualPath(start) && GetFileAttributesW(start.c_str()) == INVALID_FILE_ATTRIBUTES) start.clear();
-    }
 
     Explorer app;
     if (!app.Create(inst, start)) {

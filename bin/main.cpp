@@ -15,6 +15,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include "aether/core/single_instance.hpp"
 #include "aether/render/dcomp_layer.hpp"
 #include "aether/render/glass.hpp"
 #include "aether/render/mini_gfx.hpp"
@@ -448,8 +449,7 @@ LRESULT Bin::Handle(UINT m, WPARAM w, LPARAM l) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    HANDLE once = CreateMutexW(nullptr, TRUE, L"Aether.Bin.SingleInstance");
-    if (once && GetLastError() == ERROR_ALREADY_EXISTS) {                         // already open: just bring it forward
+    if (!aether::core::AcquireSingleInstance(L"Aether.Bin.SingleInstance")) {    // already open: just bring it forward
         if (HWND h = FindWindowW(L"AetherBinWindow", nullptr)) { if (IsIconic(h)) ShowWindow(h, SW_RESTORE); SetForegroundWindow(h); }
         return 0;
     }

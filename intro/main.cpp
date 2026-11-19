@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "aether/core/single_instance.hpp"
 #include "aether/render/dcomp_layer.hpp"
 #include "aether/render/mini_gfx.hpp"
 
@@ -196,8 +197,7 @@ private:
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    HANDLE once = CreateMutexW(nullptr, TRUE, L"Aether.Intro.SingleInstance");
-    if (once && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (!aether::core::AcquireSingleInstance(L"Aether.Intro.SingleInstance")) return 0;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (cmd && wcsstr(cmd, L"--first")) { g_first = true; g_T = 5.2f; }
     Intro intro;

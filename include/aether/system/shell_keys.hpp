@@ -17,6 +17,8 @@ constexpr UINT kMsgSwStart = WM_APP + 1, kMsgSwNext = WM_APP + 2, kMsgSwMove = W
 constexpr UINT kMsgRun = WM_APP + 6, kMsgMinAll = WM_APP + 7, kMsgSettings = WM_APP + 8;
 constexpr UINT kMsgWinCombo = WM_APP + 9;        // "a Win+<key> shortcut was consumed": the bar must not open Start on the Win release
 constexpr UINT kMsgActivate = WM_APP + 10;       // shell -> elevated bar: bring this window (WPARAM = HWND) to the front; a non-elevated process cannot always do it
+constexpr UINT kMsgClip = WM_APP + 11;           // Win+V: clipboard history
+constexpr UINT kMsgSnap = WM_APP + 12;           // Win+Arrow: WPARAM = arrow vk, LPARAM = 1 when Shift is held (move to the next monitor)
 constexpr wchar_t kCtlClass[] = L"AetherShellControl";
 constexpr wchar_t kSwitcherClass[] = L"AetherSwitcherWindow";
 
@@ -110,6 +112,21 @@ inline bool Route(const KBDLLHOOKSTRUCT* k, WPARAM w, PostFn post, GateFn gate) 
         MaskKeys();
         g_swallowedUp = vk;
         return true;
+    }
+    // ---- Win+V (clipboard history) and Win+Arrow (snap / maximize / restore / minimize, Shift: other monitor) ------------
+    // Only when Windows' own shell is not running: explorer.exe answers these itself, and answering twice would be worse than not at all.
+    // (Ctrl is excluded on purpose: Win+Ctrl+Arrow belongs to the virtual desktops.)
+    if (down && win && !ctrl && !alt && GetShellWindow() == nullptr) {
+        const bool arrow = vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN;
+        if (vk == 'V' || arrow) {
+            if (gate && !gate()) return false;
+            if (!(vk == 'V' ? post(kMsgClip, 0, 0) : post(kMsgSnap, vk, shift ? 1 : 0))) return false;
+            g_winComboTick = now;
+            post(kMsgWinCombo, 0, 0);
+            MaskKeys();
+            g_swallowedUp = vk;
+            return true;
+        }
     }
     return false;
 }

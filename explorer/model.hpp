@@ -84,6 +84,14 @@ inline bool IsUncServer(const std::wstring& p) {
 // paths that are not plain local folders (no shell clipboard / drag, no change watching, no thumbnails)
 inline bool IsVirtualPath(const std::wstring& p) { return IsFtp(p) || IsNetRoot(p) || IsUncServer(p); }
 
+// One spelling for a folder path, so "C:", "C:\" and "C:\Users\" compare equal (tab matching, command-line paths). Virtual paths stay as they are.
+inline std::wstring NormalizeFsPath(std::wstring p) {
+    if (p.empty() || IsVirtualPath(p)) return p;
+    if (p.size() == 2 && p[1] == L':') { p += L'\\'; return p; }
+    while (p.size() > 3 && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+    return p;
+}
+
 inline std::wstring JoinPath(const std::wstring& dir, const std::wstring& name) {
     if (dir.empty()) return name;
     if (IsNetRoot(dir)) return L"\\\\" + name;                    // net: + SERVER -> \\SERVER

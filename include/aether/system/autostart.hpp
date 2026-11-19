@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <string>
+#include "aether/system/bar_task.hpp"
 #include "aether/system/trial.hpp"
 
 namespace aether::system::autostart {
@@ -35,7 +36,7 @@ inline void SetBarTask(bool on) {
     std::wstring args;
     if (on) {
         if (GetFileAttributesW(bar.c_str()) == INVALID_FILE_ATTRIBUTES) return;
-        args = L"/Create /TN \"AetherBar\" /TR \"\\\"" + bar + L"\\\"\" /SC ONLOGON /RL HIGHEST /F";
+        args = bartask::CreateArgs(bar);
     } else {
         args = L"/Delete /TN \"AetherBar\" /F";
     }

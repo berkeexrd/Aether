@@ -25,7 +25,7 @@ set(IMGUI_SOURCES
 
 add_executable(Aether WIN32 ${AETHER_SOURCES} bar/weather.cpp bar/notifications.cpp ${IMGUI_SOURCES} assets/icons/aether.rc)
 target_include_directories(Aether PRIVATE include third_party/stb third_party/json ${IMGUI_DIR})
-target_link_libraries(Aether PRIVATE d3d11 dxgi d2d1 dwrite dcomp dwmapi shcore winmm ole32 oleaut32 windowsapp runtimeobject pdh winhttp shlwapi shell32 uuid windowscodecs)
+target_link_libraries(Aether PRIVATE d3d11 dxgi d2d1 dwrite dcomp dwmapi shcore winmm ole32 oleaut32 windowsapp runtimeobject pdh winhttp shlwapi shell32 uuid advapi32 windowscodecs)
 if(MSVC)
     target_compile_options(Aether PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/utf-8;/permissive-;/EHsc>")
 endif()
@@ -79,7 +79,7 @@ endif()
 # ---- Aether Intro: greeting animation shown at logon / first run ----------------------------------------------------
 add_executable(AetherIntro WIN32 intro/main.cpp src/render/dcomp_layer.cpp intro/intro.rc)
 target_include_directories(AetherIntro PRIVATE include)
-target_link_libraries(AetherIntro PRIVATE d3d11 dxgi d2d1 dwrite dcomp dwmapi shcore shell32 ole32 oleaut32 uuid windowscodecs shlwapi dxguid)
+target_link_libraries(AetherIntro PRIVATE d3d11 dxgi d2d1 dwrite dcomp dwmapi shcore shell32 ole32 oleaut32 uuid advapi32 windowscodecs shlwapi dxguid)
 if(MSVC)
     target_compile_options(AetherIntro PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/utf-8;/permissive-;/EHsc>")
 endif()

@@ -43,6 +43,7 @@
 #include "model.hpp"
 #include "shellutil.hpp"
 #include "aether/core/crash.hpp"
+#include "aether/core/single_instance.hpp"
 
 using namespace aether;
 using core::Color;
@@ -60,6 +61,7 @@ constexpr UINT kMsgIcon = WM_APP + 1;      // lParam = IconRes*
 constexpr UINT kMsgChanged = WM_APP + 2;   // the Desktop folder changed
 constexpr UINT kMsgOpDone = WM_APP + 3;    // a file operation finished (lParam = malloc'ed name to select, or null)
 constexpr UINT kMsgShowDesk = WM_APP + 4, kMsgWinE = WM_APP + 5;
+static void SetExplorerIconsHidden(bool hide);     // defined next to DesktopAnchor()
 constexpr UINT_PTR kTimerSync = 1, kTimerReload = 2, kTimerCaret = 3, kTimerSlide = 4, kTimerGuard = 5, kTimerSave = 6;
 
 const Color kWhite{1.0f, 1.0f, 1.0f, 1.0f};
@@ -252,6 +254,7 @@ private:
 
     // wallpaper
     Wall m_wall, m_wallPrev; float m_wallFade{1.0f}; std::wstring m_wallKey;
+    bool m_liveWall{false};          // Wallpaper Engine is running: its live wallpaper lives behind this window, so ours must not cover it
     Color m_bgColor{0.05f, 0.03f, 0.10f, 1.0f};
     bool m_tracking{false};
     ULONGLONG m_born{GetTickCount64()}; int m_iconSeq{0}; bool m_firstWall{true};   // start-up reveal
@@ -532,6 +535,8 @@ bool Desktop::Create(HINSTANCE inst, HMONITOR mon, int index) {
     ApplySlideTimer();
     LoadWorkArea();
     LoadItems();
+    m_liveWall = system::wallpaper::we::Running();
+    if (m_liveWall) SetExplorerIconsHidden(true);
     LoadWallpaper(true);
     CheckBin();
 
@@ -547,6 +552,24 @@ bool Desktop::Create(HINSTANCE inst, HMONITOR mon, int index) {
     ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
     StartWatch();
     return true;
+}
+
+// Explorer's own icon view. While the live wallpaper shows through this window, Explorer's icons would show through as well and
+// every icon would appear twice, so the view is hidden for as long as that lasts and put back afterwards (also when this process ends).
+static HWND g_hiddenDefView = nullptr;
+static void SetExplorerIconsHidden(bool hide) {
+    if (!hide) {
+        if (g_hiddenDefView && IsWindow(g_hiddenDefView)) ShowWindow(g_hiddenDefView, SW_SHOWNA);
+        g_hiddenDefView = nullptr;
+        return;
+    }
+    if (g_hiddenDefView && IsWindow(g_hiddenDefView)) return;
+    HWND view = nullptr;
+    if (HWND pm = FindWindowW(L"Progman", nullptr)) view = FindWindowExW(pm, nullptr, L"SHELLDLL_DefView", nullptr);
+    if (!view) {
+        for (HWND w = nullptr; !view && (w = FindWindowExW(nullptr, w, L"WorkerW", nullptr)) != nullptr;) view = FindWindowExW(w, nullptr, L"SHELLDLL_DefView", nullptr);
+    }
+    if (view && IsWindowVisible(view)) { g_hiddenDefView = view; ShowWindow(view, SW_HIDE); }
 }
 
 // The desktop windows of Explorer: Progman, or the WorkerW that hosts the icon view. We sit directly above the higher of the two.
@@ -607,7 +630,12 @@ LRESULT Desktop::Handle(UINT m, WPARAM w, LPARAM l) {
         if (w == SPI_SETDESKWALLPAPER || w == SPI_SETWORKAREA || w == 0) { LoadWorkArea(); LoadWallpaper(false); Place(); Kick(); }
         return 0;
     case WM_SETCURSOR:
-        if (LOWORD(l) == HTCLIENT) { SetCursor((m_panel && m_hotCtl) ? bui::Link() : m_hotHeader ? LoadCursorW(nullptr, IDC_SIZEALL) : bui::Arrow()); return TRUE; }
+        if (LOWORD(l) == HTCLIENT) {
+            // panel buttons and desktop icons answer with the ring cursor, the panel's title strip with the move cursor, the rest is the arrow
+            const bool onIcon = !m_panel && m_hot >= 0 && !m_marquee;
+            SetCursor(((m_panel && m_hotCtl) || onIcon) ? bui::Link() : m_hotHeader ? LoadCursorW(nullptr, IDC_SIZEALL) : bui::Arrow());
+            return TRUE;
+        }
         break;
     case WM_MOUSEMOVE: {
         m_mx = GET_X_LPARAM(l) / s; m_my = GET_Y_LPARAM(l) / s;
@@ -811,6 +839,10 @@ LRESULT Desktop::Handle(UINT m, WPARAM w, LPARAM l) {
             for (auto it = m_pendingDrop.begin(); it != m_pendingDrop.end();) if (tn - it->second.second > 15000) it = m_pendingDrop.erase(it); else ++it;
             static int n = 0;
             if (++n % 5 == 0) { CheckBin(); LoadWallpaper(false); }
+            if (n % 2 == 0) {
+                const bool live = system::wallpaper::we::Running();
+                if (live != m_liveWall) { m_liveWall = live; SetExplorerIconsHidden(live); LoadWallpaper(true); Kick(); }
+            }
             if (GetWindow(m_hwnd, GW_HWNDPREV) == nullptr) AnchorZ();
             if (m_clock) { SYSTEMTIME st; GetLocalTime(&st); if (st.wMinute != m_lastMin) { m_lastMin = st.wMinute; Kick(); } }
         } else if (w == kTimerGuard) {
@@ -827,6 +859,7 @@ LRESULT Desktop::Handle(UINT m, WPARAM w, LPARAM l) {
         else if (m_cm2) { if (SUCCEEDED(m_cm2->HandleMenuMsg(m, w, l))) return 0; }
         break;
     case WM_DESTROY:
+        SetExplorerIconsHidden(false);
         if (m_watchStop) SetEvent(m_watchStop);
         if (m_primary && g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
         if (m_primary) g_deskWnd = nullptr;
@@ -1167,6 +1200,7 @@ void Desktop::LoadWallpaper(bool force) {
     wchar_t kb[96];
     swprintf(kb, 96, L"|%d|%d|%d|%d|%08x%08x", style, m_blur, static_cast<int>(m_W * Scale()), static_cast<int>(m_H * Scale()),
              static_cast<unsigned>(ad.ftLastWriteTime.dwHighDateTime), static_cast<unsigned>(ad.ftLastWriteTime.dwLowDateTime));
+    if (m_liveWall) { m_wallKey.clear(); m_wall = Wall{}; m_wallPrev = Wall{}; Kick(); return; }   // never drawn while the live wallpaper shows: do not decode it
     const std::wstring key = path + kb;
     if (!force && key == m_wallKey) return;                 // unchanged (also when the file could not be decoded: do not retry every few seconds)
     m_wallKey = key;
@@ -1467,9 +1501,13 @@ void Desktop::DrawWall(const Wall& w, float a) {
 
 void Desktop::DrawWallpaper() {
     const Rect all{0, 0, m_W, m_H};
-    m_brush->SetColor(DC(m_bgColor));
-    m_ctx->FillRectangle(D(all), m_brush.Get());
-    if (!m_wall.bmp && !m_wallPrev.bmp) {
+    if (!m_liveWall) {
+        m_brush->SetColor(DC(m_bgColor));
+        m_ctx->FillRectangle(D(all), m_brush.Get());
+    }
+    if (m_liveWall) {
+        // transparent: the live wallpaper shows through; only the dimming and the label vignette are laid over it
+    } else if (!m_wall.bmp && !m_wallPrev.bmp) {
         // no picture: the theme's own violet backdrop
         const auto& th = render::glass::CurrentTheme();
         if (auto g = m_dcomp->CreateLinearGradientBrush(WithA(th.bodyTop, 1.0f), WithA(th.bodyBot, 1.0f), D2D1::Point2F(0, 0), D2D1::Point2F(m_W * 0.5f, m_H)))
@@ -2062,7 +2100,7 @@ void Desktop::Render() {
     const float s = Scale();
     m_W = rc.right / s; m_H = rc.bottom / s;
     m_ctx->SetTransform(D2D1::Matrix3x2F::Scale(s, s));
-    m_ctx->Clear(D2D1::ColorF(0, 0, 0, 1));
+    m_ctx->Clear(D2D1::ColorF(0, 0, 0, m_liveWall ? 0.0f : 1.0f));
     DrawWallpaper();
     if (m_clock) DrawClock();
 
@@ -2678,8 +2716,7 @@ void Desktop::OnChar(wchar_t c) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     aether::core::InstallCrashHandler(L"AetherDesktop");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    HANDLE once = CreateMutexW(nullptr, TRUE, L"Aether.Desktop.SingleInstance");
-    if (once && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (!aether::core::AcquireSingleInstance(L"Aether.Desktop.SingleInstance")) return 0;
     SetCurrentProcessExplicitAppUserModelID(L"Aether.Desktop");
     OleInitialize(nullptr);
 

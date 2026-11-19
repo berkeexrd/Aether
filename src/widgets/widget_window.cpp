@@ -909,7 +909,11 @@ LRESULT DesktopWidgetWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, L
         }
 
         case WM_SETCURSOR: {
-            if (LOWORD(lParam) == HTCLIENT && (m_gripHot || m_resizing)) { SetCursor(LoadCursor(nullptr, IDC_SIZENWSE)); return TRUE; }
+            if (LOWORD(lParam) == HTCLIENT) {
+                if (m_gripHot || m_resizing) { SetCursor(LoadCursor(nullptr, IDC_SIZENWSE)); return TRUE; }
+                // a card is moved by dragging it: say so while it is being moved
+                if (m_isDragging) { SetCursor(LoadCursor(nullptr, IDC_SIZEALL)); return TRUE; }
+            }
             break;
         }
 

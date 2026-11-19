@@ -28,12 +28,17 @@ public:
     static ShellTaskbarGuard& Instance() { static ShellTaskbarGuard g; return g; }
     void Hide(bool hard);
     void Restore();
-    void KeepHidden();
+    // Called often: hides the stock bar again if Explorer showed it (it does at start-up, after an Explorer restart, on a display change) and
+    // retries when Explorer had not created its taskbar yet when Hide() was called. true = the stock bar's state was changed just now, so the
+    // bars should claim the work area again.
+    bool KeepHidden();
     [[nodiscard]] bool IsHidden() const { return m_hidden; }
 private:
     UINT m_prevState{0};
     bool m_hidden{false};
     bool m_hard{false};
+    bool m_wanted{false};          // Hide() was asked for (it may still be waiting for Explorer's taskbar to exist)
+    ULONGLONG m_lastStateCheck{0};
 };
 
 // Pins an app / file / folder to the dock (Start menu "Pin to bar"). Returns false when it is already pinned.
@@ -78,10 +83,10 @@ public:
 
 private:
     static constexpr UINT WM_APPBAR = WM_USER + 1;
-    enum class Hit { None, Start, Search, Item, Chevron, Quick, Network, Clock, Bell, Weather, Desktop, Right, Dock };
+    enum class Hit { None, Start, Search, Item, Chevron, Quick, Network, Lang, Clock, Bell, Weather, Desktop, Right, Dock };
 
     struct LayoutInfo {
-        core::Rect dock, right, start, search, chevron, quick, network, clock, bell, weather, desktop;
+        core::Rect dock, right, start, search, chevron, quick, network, lang, clock, bell, weather, desktop;
         std::vector<core::Rect> items;
     };
 
@@ -149,6 +154,15 @@ private:
     int m_windowW{0}, m_windowH{0}, m_reservedPx{0};
     bool m_visible{true};
     render::Backdrop m_backdrop;               // blurred wallpaper strip behind the pills
+    std::wstring m_langCode, m_langName;       // input language of the window in front ("TR", "Türkçe"); the button exists with 2+ layouts installed
+    int m_langCount{1};
+    float m_langTimer{9.0f};
+    void PollInputLanguage();
+    // windows that asked for attention (FlashWindowEx: a chat message, a finished download); their dock buttons pulse until the window is used
+    std::map<HWND, ULONGLONG> m_flash;
+    UINT m_shellHookMsg{0};
+    [[nodiscard]] bool IsFlashing(const Entry& e) const;
+    void SwitchInputLanguage();
     float m_hoverAmt[16]{};                    // eased hover amount per Hit kind (system pill highlights)
 
     std::vector<std::unique_ptr<Entry>> m_entries;

@@ -24,6 +24,7 @@
 #include <endpointvolume.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <windowsx.h>
 #include <algorithm>
 #include <climits>
@@ -264,7 +265,8 @@ static HWND StockTray() {
     return nullptr;
 }
 
-static void ForEachShellBar(void (*fn)(HWND)) {
+template <class Fn>
+static void ForEachShellBar(Fn fn) {
     if (HWND t = StockTray()) fn(t);
     HWND sec = nullptr;
     while ((sec = FindWindowExW(nullptr, sec, L"Shell_SecondaryTrayWnd", nullptr)) != nullptr) fn(sec);
@@ -296,6 +298,7 @@ static void WriteSavedTaskbarState(UINT v) {
 }
 
 void ShellTaskbarGuard::Hide(bool hard) {
+    m_wanted = true; m_hard = hard;                  // remembered: when Explorer's taskbar does not exist yet KeepHidden() retries
     HWND tray = StockTray();
     if (!tray) return;
     APPBARDATA abd = {sizeof(abd)};
@@ -315,9 +318,31 @@ void ShellTaskbarGuard::Hide(bool hard) {
     m_hidden = true;
 }
 
-void ShellTaskbarGuard::KeepHidden() {
-    if (!m_hidden || !m_hard) return;
-    ForEachShellBar([](HWND h) { if (IsWindowVisible(h)) ShowWindow(h, SW_HIDE); });
+bool ShellTaskbarGuard::KeepHidden() {
+    if (!m_wanted) return false;
+    if (!m_hidden) {                                  // Explorer's taskbar was not there yet at start-up (the bar often starts first)
+        Hide(m_hard);
+        return m_hidden;
+    }
+    bool changed = false;
+    // Explorer applies its own taskbar settings a moment after it creates the bar, and again after a restart: the auto-hide that releases the
+    // work area is set back on, otherwise its reserved strip stays and windows (maximized ones) sit above / under our bar.
+    const ULONGLONG now = GetTickCount64();
+    if (now - m_lastStateCheck >= 1500) {
+        m_lastStateCheck = now;
+        if (HWND tray = StockTray()) {
+            APPBARDATA abd = {sizeof(abd)};
+            abd.hWnd = tray;
+            const UINT st = static_cast<UINT>(SHAppBarMessage(ABM_GETSTATE, &abd));
+            if (!(st & ABS_AUTOHIDE)) {
+                abd.lParam = static_cast<LPARAM>(st | ABS_AUTOHIDE);
+                SHAppBarMessage(ABM_SETSTATE, &abd);
+                changed = true;
+            }
+        }
+    }
+    if (m_hard) ForEachShellBar([&](HWND h) { if (IsWindowVisible(h)) { ShowWindow(h, SW_HIDE); changed = true; } });
+    return changed;
 }
 
 void ShellTaskbarGuard::Restore() {
@@ -333,6 +358,7 @@ void ShellTaskbarGuard::Restore() {
     ForEachShellBar([](HWND h) { ShowWindow(h, SW_SHOWNA); });
     if (m_hidden) { const std::wstring f = TaskbarStateFile(); if (!f.empty()) DeleteFileW(f.c_str()); }
     m_hidden = false;
+    m_wanted = false;                                 // restored on purpose: KeepHidden() must not hide it again
 }
 
 // =============================================================================================
@@ -356,6 +382,7 @@ AetherBar::AetherBar(HMONITOR monitor, bool primary, StartMenu* start)
     , m_dockAppear(0.0f, animation::SpringConfig{300.0f, 28.0f, 1.0f, 0.002f}) {}
 
 AetherBar::~AetherBar() {
+    if (m_hwnd) DeregisterShellHookWindow(m_hwnd);
     UnregisterAppBar();
     if (m_hwnd) DestroyWindow(m_hwnd);
 }
@@ -417,6 +444,12 @@ bool AetherBar::Create() {
     if (!m_preview->Create([this](HWND w) { ActivateWindow(w); })) m_preview.reset();   // no preview, everything else keeps working
 
     m_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+    if (m_primary) PollInputLanguage();                // so the language button is there from the first frame (no later widening of the pill)
+    m_shellHookMsg = RegisterWindowMessageW(L"SHELLHOOK");
+    RegisterShellHookWindow(m_hwnd);                  // HSHELL_FLASH: an app wants attention
+    // Explorer (not elevated) broadcasts this when its taskbar is created, at logon and after a restart. This window is elevated, so UIPI
+    // dropped the broadcast and the stock taskbar was never hidden again.
+    if (m_taskbarCreatedMsg) ChangeWindowMessageFilterEx(m_hwnd, m_taskbarCreatedMsg, MSGFLT_ALLOW, nullptr);
     PinStore::I().Load();
 
     RegisterAppBar();
@@ -683,6 +716,7 @@ bool AetherBar::IsAnimating() const {
     if (m_dragging) return true;
     if (m_pinHoverAmt > 0.01f || GetTickCount64() - m_pinHoverTick < 300) return true;
     if (m_preview && m_preview->IsOpen()) return true;
+    { const ULONGLONG now = GetTickCount64(); for (const auto& f : m_flash) if (now - f.second < 6000) return true; }   // the pulse runs 6 s, then the ring stays still
     for (const auto& e : m_entries) {
         if (!e->appear.IsResting() || !e->hover.IsResting() || !e->active.IsResting() || e->slide != 0.0f) return true;
     }
@@ -698,10 +732,19 @@ void AetherBar::Tick(float dt) {
         if (!over && m_pinHoverAmt < 0.01f) m_pinHoverAmt = 0.0f;
     }
     UpdatePreview(dt);
+    if (!m_flash.empty()) {                                                    // forget windows that are gone or have been brought to the front
+        HWND fg = GetAncestor(GetForegroundWindow(), GA_ROOT);
+        for (auto it = m_flash.begin(); it != m_flash.end();) it = (!IsWindow(it->first) || it->first == fg) ? m_flash.erase(it) : std::next(it);
+    }
+    m_langTimer += dt;
+    if (m_primary && m_langTimer >= 0.3f) { m_langTimer = 0.0f; PollInputLanguage(); }
     m_refreshTimer += dt;
     if (!m_dragging && (m_refreshTimer >= 0.35f || m_pinVersion != PinStore::I().version)) { m_refreshTimer = 0.0f; RefreshWindows(); }
     m_keepHiddenTimer += dt;
-    if (m_keepHiddenTimer >= 0.1f) { m_keepHiddenTimer = 0.0f; ShellTaskbarGuard::Instance().KeepHidden(); }
+    if (m_keepHiddenTimer >= 0.1f) {
+        m_keepHiddenTimer = 0.0f;
+        if (ShellTaskbarGuard::Instance().KeepHidden()) SetAppBarPos();   // the stock bar let go of the work area: claim it
+    }
 
     if (m_primary) {
         m_netTimer += dt;
@@ -804,11 +847,12 @@ void AetherBar::ComputeLayout() {
     const bool battery = m_primary && GetSystemPowerStatus(&ps) && ps.BatteryFlag != 128 && ps.BatteryLifePercent <= 100;
     const float chevW = m_primary ? 34.0f * s : 0.0f;
     const float netW = m_primary ? 38.0f * s : 0.0f;
+    const float langW = (m_primary && m_langCount > 1 && !m_langCode.empty()) ? 40.0f * s : 0.0f;   // input language (TR / EN), only with 2+ layouts
     const float bellW = m_primary ? 40.0f * s : 0.0f;
     const float quickW = m_primary ? (battery ? 104.0f : 40.0f) * s : 0.0f;
     const float clockW = 84.0f * s;
     const float deskW = m_primary ? 14.0f * s : 0.0f;   // show-desktop zone (invisible until hovered)
-    const float rightW = 10.0f * s + chevW + quickW + netW + clockW + bellW + deskW;
+    const float rightW = 10.0f * s + chevW + quickW + netW + langW + clockW + bellW + deskW;
     const float rx = static_cast<float>(m_windowW) - kMargin * s * 1.4f - rightW;
     m_layout.right = Rect{rx, top, rightW, h};
 
@@ -817,6 +861,7 @@ void AetherBar::ComputeLayout() {
     m_layout.chevron = Rect{cx, iy, chevW, ih}; cx += chevW;
     m_layout.quick = Rect{cx, iy, quickW, ih}; cx += quickW;
     m_layout.network = Rect{cx, iy, netW, ih}; cx += netW;
+    m_layout.lang = Rect{cx, iy, langW, ih}; cx += langW;
     m_layout.clock = Rect{cx, iy, clockW, ih}; cx += clockW;
     m_layout.bell = Rect{cx, iy, bellW, ih}; cx += bellW;
     m_layout.desktop = Rect{cx, iy, deskW, ih};
@@ -825,6 +870,40 @@ void AetherBar::ComputeLayout() {
 
 float AetherBar::LiftPx() const {
     return (m_top ? -1.0f : 1.0f) * (1.0f - Clamp01(m_dockAppear.GetValue())) * 30.0f * m_dpi;
+}
+
+// The keyboard layout of the window in front ("TR" / "EN"). Layouts are per window / thread, so a click on this (non-activating) bar asks that
+// window to move on to the next one, like Windows' own language button does.
+bool AetherBar::IsFlashing(const Entry& e) const {
+    if (m_flash.empty()) return false;
+    for (HWND w : e.windows) if (m_flash.count(w)) return true;
+    return false;
+}
+
+void AetherBar::PollInputLanguage() {
+    static ULONGLONG countAt = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - countAt > 4000) { countAt = now; m_langCount = std::max(1, GetKeyboardLayoutList(0, nullptr)); }
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    const DWORD thread = fg ? GetWindowThreadProcessId(fg, &pid) : 0;
+    if (!thread || pid == GetCurrentProcessId()) return;                       // our own flyouts: keep what was shown
+    const LANGID id = LOWORD(reinterpret_cast<UINT_PTR>(GetKeyboardLayout(thread)));
+    wchar_t code[16] = {}, name[64] = {};
+    if (!GetLocaleInfoW(id, LOCALE_SISO639LANGNAME, code, 16)) return;
+    GetLocaleInfoW(id, LOCALE_SLOCALIZEDLANGUAGENAME, name, 64);
+    for (wchar_t* p = code; *p; ++p) *p = static_cast<wchar_t>(towupper(*p));
+    if (m_langCode != code) m_langCode = code;
+    if (m_langName != name) m_langName = name;
+}
+
+void AetherBar::SwitchInputLanguage() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return;
+    DWORD pid = 0; GetWindowThreadProcessId(fg, &pid);
+    if (pid == GetCurrentProcessId()) return;
+    PostMessageW(fg, WM_INPUTLANGCHANGEREQUEST, INPUTLANGCHANGE_FORWARD, static_cast<LPARAM>(1) /* HKL_NEXT */);
+    m_langTimer = 9.0f;                                                        // re-read it right away
 }
 
 // Polls the taskbar position every 2 s (the user can move it in Windows' settings while we run).
@@ -904,6 +983,7 @@ void AetherBar::ComputeTooltip() {
             case Hit::Chevron: text = i18n::Pick(L"System tray (hidden icons)", L"Sistem tepsisi (gizli simgeler)"); anchor = m_layout.chevron.Center().x; break;
             case Hit::Quick:   text = i18n::Pick(L"Quick settings  -  scroll to change volume", L"Hızlı ayarlar  -  ses için kaydırın"); anchor = m_layout.quick.Center().x; break;
             case Hit::Network: text = m_netKind == 0 ? i18n::Pick(L"No network connection", L"Ağ bağlantısı yok") : i18n::Pick(L"Network", L"Ağ"); anchor = m_layout.network.Center().x; break;
+            case Hit::Lang:    text = (i18n::Pick(L"Input language: ", L"Giriş dili: ") + m_langName + i18n::Pick(L"  -  click to switch", L"  -  değiştirmek için tıkla")); anchor = m_layout.lang.Center().x; break;
             case Hit::Clock:   text = i18n::Pick(L"Calendar", L"Takvim"); anchor = m_layout.clock.Center().x; break;
             case Hit::Bell:    text = i18n::Pick(L"Notifications", L"Bildirimler"); anchor = m_layout.bell.Center().x; break;
             case Hit::Weather: {
@@ -1215,6 +1295,16 @@ void AetherBar::Render() {
             const D2D1_RECT_F dst = RF(c.x - icon / 2, cy - icon / 2 - 1.0f * s, c.x + icon / 2, cy + icon / 2 - 1.0f * s);
             ctx->DrawBitmap(e.icon.Get(), &dst, (e.Running() ? 1.0f : 0.78f) * appear, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
         }
+        if (IsFlashing(e)) {                                                       // the app wants attention: a pulsing amber ring around the button
+            ULONGLONG since = 0; for (HWND fw : e.windows) { auto fi = m_flash.find(fw); if (fi != m_flash.end()) since = std::max(since, fi->second); }
+            const float pulse = GetTickCount64() - since < 6000 ? 0.5f + 0.5f * std::sin(static_cast<float>(GetTickCount64() % 1200) / 1200.0f * 6.2831853f) : 0.7f;
+            if (auto g = m_dcomp->CreateSquircleGeometry(slot, 14.0f * s)) {
+                m_brush->SetColor(D2D1::ColorF(1.0f, 0.70f, 0.20f, (0.10f + 0.20f * pulse) * appear));
+                ctx->FillGeometry(g.Get(), m_brush.Get());
+                m_brush->SetColor(D2D1::ColorF(1.0f, 0.74f, 0.30f, (0.40f + 0.50f * pulse) * appear));
+                ctx->DrawGeometry(g.Get(), m_brush.Get(), 1.4f * s);
+            }
+        }
         if (e.Running()) {
             // thin lilac "light line" hugging the bottom rim: bright centre fading to both ends + soft bloom
             const float dw = (14.0f + 8.0f * act) * s, dh = 2.2f * s;
@@ -1259,6 +1349,7 @@ void AetherBar::Render() {
     hoverBg(m_layout.chevron, Hit::Chevron);
     hoverBg(m_layout.quick, Hit::Quick);
     hoverBg(m_layout.network, Hit::Network);
+    hoverBg(m_layout.lang, Hit::Lang);
     hoverBg(m_layout.clock, Hit::Clock);
     hoverBg(m_layout.bell, Hit::Bell);
 
@@ -1286,6 +1377,7 @@ void AetherBar::Render() {
     if (m_primary) {
         const Rect& nw = m_layout.network;
         DrawGlyph(ctx, m_netKind == 2 ? ui::kGlyphEthernet : ui::kGlyphWifi, RF(nw), Color{1.0f, 1.0f, 1.0f, m_netKind == 0 ? 0.35f : 0.92f});
+        if (m_layout.lang.width > 0) DrawText(ctx, m_langCode, m_fontTime.Get(), RF(m_layout.lang), Color{1.0f, 1.0f, 1.0f, 0.92f});
         const bool tinted = !render::glass::CurrentTheme().flat;
         DrawGlyph(ctx, kGlyphBell, RF(m_layout.bell),
                   tinted ? Color::Lerp(Color{1.0f, 1.0f, 1.0f, 1.0f}, render::glass::kVioletLight, 0.60f) : Color{1.0f, 1.0f, 1.0f, 0.88f});
@@ -1383,6 +1475,7 @@ AetherBar::Hit AetherBar::HitTest(const Vec2& pt, int& index) const {
     if (m_layout.chevron.width > 0 && m_layout.chevron.Contains(p)) return Hit::Chevron;
     if (m_layout.quick.width > 0 && m_layout.quick.Contains(p)) return Hit::Quick;
     if (m_layout.network.width > 0 && m_layout.network.Contains(p)) return Hit::Network;
+    if (m_layout.lang.width > 0 && m_layout.lang.Contains(p)) return Hit::Lang;
     if (m_layout.clock.Contains(p)) return Hit::Clock;
     if (m_layout.bell.width > 0 && m_layout.bell.Contains(p)) return Hit::Bell;
     if (m_layout.weather.width > 0 && m_layout.weather.Contains(p)) return Hit::Weather;
@@ -1566,17 +1659,69 @@ void AetherBar::AdjustVolume(float delta) {
     m_tipOverrideTimer = 1.3f;
 }
 
+// "Jump list" of a dock button: the files that were opened lately with this program. Windows keeps them as shortcuts in the Recent folder; a
+// file belongs to the program when that program is the one Windows opens the file's type with. Newest first, at most `maxItems`.
+static std::vector<std::wstring> RecentFilesOf(const std::wstring& exePath, size_t maxItems) {
+    std::vector<std::wstring> out;
+    if (exePath.empty() || system::IsAppsFolderPath(exePath)) return out;
+    PWSTR rp = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Recent, 0, nullptr, &rp)) || !rp) return out;
+    const std::wstring dir = rp; CoTaskMemFree(rp);
+    struct Lnk { std::wstring path; ULONGLONG t; };
+    std::vector<Lnk> lnks;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW((dir + L"\\*.lnk").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do { lnks.push_back({dir + L"\\" + fd.cFileName, (static_cast<ULONGLONG>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime}); } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(lnks.begin(), lnks.end(), [](const Lnk& a, const Lnk& b) { return a.t > b.t; });
+    ComPtr<IShellLinkW> sl;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl)))) return out;
+    ComPtr<IPersistFile> pf;
+    if (FAILED(sl.As(&pf))) return out;
+    std::map<std::wstring, std::wstring> handlerOf;                       // extension -> program that opens it
+    size_t looked = 0;
+    for (const auto& l : lnks) {
+        if (out.size() >= maxItems || ++looked > 60) break;
+        wchar_t target[MAX_PATH] = {};
+        if (FAILED(pf->Load(l.path.c_str(), STGM_READ)) || FAILED(sl->GetPath(target, MAX_PATH, nullptr, SLGP_RAWPATH)) || !target[0]) continue;
+        const DWORD attr = GetFileAttributesW(target);
+        if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) continue;      // gone, or a folder
+        const wchar_t* ext = PathFindExtensionW(target);
+        if (!ext || !*ext) continue;
+        auto it = handlerOf.find(ext);
+        if (it == handlerOf.end()) {
+            wchar_t exe[MAX_PATH] = {}; DWORD n = MAX_PATH;
+            const bool ok = SUCCEEDED(AssocQueryStringW(ASSOCF_NONE, ASSOCSTR_EXECUTABLE, ext, L"open", exe, &n));
+            it = handlerOf.emplace(ext, ok ? exe : L"").first;
+        }
+        if (!it->second.empty() && _wcsicmp(it->second.c_str(), exePath.c_str()) == 0) out.push_back(target);
+    }
+    return out;
+}
+
 void AetherBar::ShowItemMenu(int index) {
     if (index < 0 || index >= static_cast<int>(m_entries.size())) return;
     Entry& e = *m_entries[index];
     POINT pt; GetCursorPos(&pt);
     std::vector<aether::ui::MenuEntry> items;
+    const std::vector<std::wstring> recent = RecentFilesOf(e.exePath, 6);
+    for (size_t i = 0; i < recent.size(); ++i) {
+        std::wstring name = recent[i].substr(recent[i].find_last_of(L'\\') + 1);
+        if (name.size() > 42) name = name.substr(0, 40) + L"…";
+        items.push_back(aether::ui::MenuItem(100 + static_cast<int>(i), name, 0xE8A5));
+    }
+    if (!recent.empty()) items.push_back(aether::ui::MenuSeparator());
     items.push_back(aether::ui::MenuItem(1, i18n::Pick(L"Open new window", L"Yeni pencere aç"), 0xE8A7));
     if (!e.exePath.empty()) items.push_back(aether::ui::MenuItem(2, e.pinned ? i18n::Pick(L"Unpin from bar", L"Çubuktan kaldır") : i18n::Pick(L"Pin to bar", L"Çubuğa sabitle"), 0xE718));
     if (e.Running()) items.push_back(aether::ui::MenuItem(3, e.windows.size() > 1 ? i18n::Pick(L"Close all windows", L"Tüm pencereleri kapat") : i18n::Pick(L"Close window", L"Pencereyi kapat"), 0xE711, true));
     const int cmd = aether::ui::ShowContextMenu(items, pt, true);
     PinStore& store = PinStore::I();
-    if (cmd == 1 && !e.exePath.empty()) LaunchEntry(e);
+    if (cmd >= 100 && cmd < 100 + static_cast<int>(recent.size())) {
+        const std::wstring& f = recent[static_cast<size_t>(cmd - 100)];
+        ShellExecuteW(nullptr, L"open", f.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    else if (cmd == 1 && !e.exePath.empty()) LaunchEntry(e);
     else if (cmd == 2) {
         const int idx = store.IndexOf(e.exePath);
         if (idx >= 0) store.pins.erase(store.pins.begin() + idx); else store.pins.push_back(e.exePath);
@@ -1616,7 +1761,14 @@ LRESULT AetherBar::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (target && IsWindow(target)) ActivateWindow(target);
         return 0;
     }
+    if (m_shellHookMsg && msg == m_shellHookMsg) {
+        HWND target = reinterpret_cast<HWND>(lp);
+        if (wp == 0x8006 /*HSHELL_FLASH*/) { if (target && target != GetForegroundWindow()) m_flash[target] = GetTickCount64(); }
+        else if (wp == 4 /*HSHELL_WINDOWACTIVATED*/ || wp == 0x8004 /*HSHELL_RUDEAPPACTIVATED*/) m_flash.erase(target);
+        return 0;
+    }
     if (m_taskbarCreatedMsg && msg == m_taskbarCreatedMsg) {
+        UnregisterAppBar(); RegisterAppBar();                          // the new Explorer knows nothing about our work-area reservation
         PostThreadMessageW(GetCurrentThreadId(), WM_APP + 3, 0, 0);   // manager re-applies the guard
         return 0;
     }
@@ -1728,6 +1880,7 @@ LRESULT AetherBar::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case Hit::Chevron: ToggleFlyout(m_tray, m_layout.chevron); break;      // Aether tray
                 case Hit::Quick:   ToggleFlyout(m_quick, m_layout.quick); break;       // quick settings
                 case Hit::Network: ToggleFlyout(m_net, m_layout.network); break;       // own network centre
+                case Hit::Lang:    SwitchInputLanguage(); break;                         // next keyboard layout of the window in front
                 case Hit::Clock:   ToggleFlyout(m_calendar, m_layout.clock); break;    // clock + calendar
                 case Hit::Bell:    ToggleFlyout(m_notify, m_layout.bell); break;   // Aether notification centre
                 case Hit::Weather: ToggleFlyout(m_weather, m_layout.weather); break;     // animated weather panel

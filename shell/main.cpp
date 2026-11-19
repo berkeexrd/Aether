@@ -27,6 +27,8 @@
 #include "aether/system/shell_keys.hpp"
 #include "aether/system/icon_pack.hpp"
 #include "aether/core/crash.hpp"
+#include "aether/core/single_instance.hpp"
+#include "aether/system/bar_task.hpp"
 
 using namespace aether;
 using aether::mg::Color;
@@ -668,6 +670,379 @@ LRESULT RunBox::Handle(UINT m, WPARAM w, LPARAM l) {
 }
 
 // =============================================================================================================================
+//   Win+V : clipboard history
+// =============================================================================================================================
+// Text that was copied, newest first. Kept in memory only (nothing is written to disk: clipboards carry passwords). Items that a program marks as
+// private (password managers set "ExcludeClipboardContentFromMonitorProcessing" / "CanIncludeInClipboardHistory" = 0) are never recorded.
+class ClipPanel {
+public:
+    void OnClipboardChanged();                 // WM_CLIPBOARDUPDATE: reads the text on a worker thread (an owner that renders lazily can take long)
+    void AddText(std::wstring* text);          // the worker's result (heap string, may be null), back on the shell thread
+    void Open();
+    static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l);
+private:
+    struct Item { std::wstring text; ULONGLONG at; };
+    int m_pasteTries{0};
+    static constexpr size_t kMax = 25;
+    static constexpr int kRows = 8;
+    static constexpr float kW = 460.0f, kHead = 56.0f, kRow = 46.0f, kFoot = 38.0f;
+    HWND m_hwnd{nullptr}, m_prev{nullptr};
+    std::unique_ptr<render::DCompLayer> m_dc;
+    mg::Gfx m_g;
+    std::vector<Item> m_items;
+    DWORD m_ownSeq{0};
+    int m_sel{0}, m_top{0}, m_hover{-1};
+    float m_scale{1.0f};
+
+    bool EnsureWindow();
+    void Render();
+    void Hide() { if (m_hwnd && IsWindowVisible(m_hwnd)) ShowWindow(m_hwnd, SW_HIDE); }
+    void Remove(int i);
+    void Reshape();
+    void Commit(int i);
+    float PanelH() const { return kHead + kRow * static_cast<float>(std::max(1, std::min<int>(kRows, static_cast<int>(m_items.size())))) + kFoot; }
+    Rect RowRect(int vis) const { return Rect{20.0f, 10.0f + kHead + kRow * static_cast<float>(vis), kW - 20.0f, kRow - 4.0f}; }     // panel is x 10 .. 10 + kW
+    Rect ClearRect() const { return Rect{kW - 130.0f, 10.0f + PanelH() - kFoot, 130.0f, kFoot - 8.0f}; }
+    int HitRow(float x, float y) const;
+    LRESULT Handle(UINT m, WPARAM w, LPARAM l);
+};
+ClipPanel g_clip;
+
+namespace {
+bool ClipFormatBlocks() {
+    static const UINT excl = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
+    static const UINT canHist = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
+    if (IsClipboardFormatAvailable(excl)) return true;
+    if (IsClipboardFormatAvailable(canHist)) {
+        if (HANDLE h = GetClipboardData(canHist)) {
+            if (auto* p = static_cast<const DWORD*>(GlobalLock(h))) { const bool no = *p == 0; GlobalUnlock(h); if (no) return true; }
+        }
+    }
+    return false;
+}
+std::wstring OneLine(const std::wstring& s, size_t maxLen) {
+    std::wstring o; o.reserve(std::min(s.size(), maxLen + 1));
+    bool sp = true;
+    for (wchar_t c : s) {
+        const bool white = c == L' ' || c == L'\t' || c == L'\r' || c == L'\n';
+        if (white) { if (!sp) { o.push_back(L' '); sp = true; } } else { o.push_back(c); sp = false; }
+        if (o.size() >= maxLen) break;
+    }
+    while (!o.empty() && o.back() == L' ') o.pop_back();
+    return o;
+}
+std::wstring AgeText(ULONGLONG at) {
+    const ULONGLONG s = (GetTickCount64() - at) / 1000;
+    if (s < 45) return L"şimdi";
+    if (s < 3600) return std::to_wstring(std::max<ULONGLONG>(1, s / 60)) + L" dk";
+    return std::to_wstring(s / 3600) + L" sa";
+}
+} // namespace
+
+void ClipPanel::OnClipboardChanged() {
+    const DWORD seq = GetClipboardSequenceNumber();
+    if (seq == m_ownSeq) return;                                           // we put it there ourselves (a paste from the history)
+    constexpr UINT kMsgClipText = WM_APP + 13;
+    const HWND ctl = g_ctl;
+    std::thread([ctl]() {
+        std::wstring* result = nullptr;
+        bool opened = false;
+        for (int i = 0; i < 8 && !opened; ++i) { opened = OpenClipboard(nullptr) != FALSE; if (!opened) Sleep(15); }   // another program may hold it for a moment
+        if (opened) {
+            std::wstring text;
+            if (!ClipFormatBlocks() && IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+                if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {         // may wait for the owner to render: that is why this is not on the shell thread
+                    if (auto* p = static_cast<const wchar_t*>(GlobalLock(h))) {
+                        const size_t cap = GlobalSize(h) / sizeof(wchar_t);
+                        size_t n = 0; while (n < cap && p[n] && n < 20000) ++n;
+                        text.assign(p, n);
+                        GlobalUnlock(h);
+                    }
+                }
+            }
+            CloseClipboard();
+            if (text.find_first_not_of(L" \t\r\n") != std::wstring::npos) result = new std::wstring(std::move(text));   // not empty / whitespace only
+        }
+        if (!result || !IsWindow(ctl) || !PostMessageW(ctl, kMsgClipText, 0, reinterpret_cast<LPARAM>(result))) delete result;
+    }).detach();
+}
+
+void ClipPanel::AddText(std::wstring* p) {
+    if (!p) return;
+    std::wstring text = std::move(*p); delete p;
+    for (size_t i = 0; i < m_items.size(); ++i) if (m_items[i].text == text) { m_items.erase(m_items.begin() + static_cast<std::ptrdiff_t>(i)); break; }
+    m_items.insert(m_items.begin(), Item{std::move(text), GetTickCount64()});
+    if (m_items.size() > kMax) m_items.resize(kMax);
+    if (m_hwnd && IsWindowVisible(m_hwnd)) { m_sel = 0; m_top = 0; Reshape(); Render(); }
+}
+
+bool ClipPanel::EnsureWindow() {
+    if (m_hwnd) return true;
+    WNDCLASSEXW wc = {sizeof(wc)};
+    wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"AetherClipWindow"; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassExW(&wc);
+    m_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP, L"AetherClipWindow", L"Pano geçmişi", WS_POPUP, 0, 0, 480, 480, nullptr, nullptr, GetModuleHandleW(nullptr), this);
+    if (!m_hwnd) return false;
+    m_dc = std::make_unique<render::DCompLayer>();
+    if (!m_dc->Initialize(m_hwnd, 480, 480)) { DestroyWindow(m_hwnd); m_hwnd = nullptr; return false; }
+    m_g.Init(m_dc.get());
+    return true;
+}
+
+void ClipPanel::Open() {
+    if (!EnsureWindow()) return;
+    if (IsWindowVisible(m_hwnd)) { Hide(); return; }                           // Win+V again closes it
+    HWND fg = GetForegroundWindow();
+    m_prev = (fg && fg != m_hwnd) ? fg : nullptr;                              // where the pasted text goes
+    m_sel = 0; m_top = 0; m_hover = -1;
+    MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(WorkMonitor(), &mi);
+    SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 100, 100, SWP_NOACTIVATE | SWP_NOMOVE | SWP_HIDEWINDOW);
+    SetWindowPos(m_hwnd, HWND_TOPMOST, mi.rcWork.left, mi.rcWork.top, 100, 100, SWP_NOACTIVATE | SWP_NOSIZE);   // on that monitor first: its DPI applies
+    m_scale = GetDpiForWindow(m_hwnd) / 96.0f;
+    const int pw = static_cast<int>((kW + 20) * m_scale), ph = static_cast<int>((PanelH() + 20) * m_scale);
+    const int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - pw) / 2, y = mi.rcWork.top + static_cast<int>((mi.rcWork.bottom - mi.rcWork.top) * 0.22f);
+    SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, pw, ph, SWP_NOACTIVATE);
+    m_dc->Resize(pw, ph);
+    m_g.ClearFormats();
+    ShowWindow(m_hwnd, SW_SHOW);
+    ForceForeground(m_hwnd);
+    SetFocus(m_hwnd);
+    Render();
+}
+
+int ClipPanel::HitRow(float x, float y) const {
+    const int n = std::min<int>(kRows, static_cast<int>(m_items.size()) - m_top);
+    for (int i = 0; i < n; ++i) if (RowRect(i).Contains(x, y)) return m_top + i;
+    return -1;
+}
+
+void ClipPanel::Remove(int i) {
+    if (i < 0 || i >= static_cast<int>(m_items.size())) return;
+    m_items.erase(m_items.begin() + i);
+    m_sel = std::clamp(m_sel, 0, std::max(0, static_cast<int>(m_items.size()) - 1));
+    m_top = std::clamp(m_top, 0, std::max(0, static_cast<int>(m_items.size()) - kRows));
+    Reshape();
+}
+
+void ClipPanel::Reshape() {                                                    // the panel's height follows the number of rows
+    const int ph = static_cast<int>((PanelH() + 20) * m_scale);
+    RECT r; GetWindowRect(m_hwnd, &r);
+    SetWindowPos(m_hwnd, nullptr, 0, 0, r.right - r.left, ph, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    m_dc->Resize(r.right - r.left, ph);
+}
+
+void ClipPanel::Commit(int i) {
+    if (i < 0 || i >= static_cast<int>(m_items.size())) return;
+    const std::wstring text = m_items[static_cast<size_t>(i)].text;
+    if (OpenClipboard(m_hwnd)) {
+        EmptyClipboard();
+        if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t))) {
+            if (void* p = GlobalLock(g)) { memcpy(p, text.c_str(), (text.size() + 1) * sizeof(wchar_t)); GlobalUnlock(g); SetClipboardData(CF_UNICODETEXT, g); }
+            else GlobalFree(g);
+        }
+        CloseClipboard();
+        m_ownSeq = GetClipboardSequenceNumber();
+    }
+    Item it = m_items[static_cast<size_t>(i)]; it.at = GetTickCount64();
+    m_items.erase(m_items.begin() + i); m_items.insert(m_items.begin(), it);
+    Hide();
+    if (m_prev && IsWindow(m_prev)) Activate(m_prev);
+    SetTimer(m_hwnd, 1, 110, nullptr);                                         // the window must be in front before Ctrl+V is sent
+}
+
+void ClipPanel::Render() {
+    if (!m_g.Begin()) return;
+    auto* ctx = m_g.ctx;
+    ctx->SetTransform(D2D1::Matrix3x2F::Scale(m_scale, m_scale));
+    const Color v = render::glass::kViolet, vl = render::glass::kVioletLight;
+    const Rect panel{10, 10, kW, PanelH()};
+    m_g.Glow(panel, 20, v, 10.0f, 0.8f);
+    m_g.VGradientRR(panel, 20, Color{0.09f, 0.06f, 0.19f, 0.97f}, Color{0.04f, 0.03f, 0.10f, 0.98f});
+    m_g.StrokeRR(panel, 20, WithA(vl, 0.40f), 1.2f);
+    m_g.Glyph(0xE8C8, Rect{panel.x + 18, panel.y + 12, 30, 30}, 17.0f, vl);
+    m_g.Text(L"Pano geçmişi", Rect{panel.x + 52, panel.y + 12, 240, 30}, 16.0f, 600, kWhite);
+    if (m_items.empty()) {
+        m_g.Text(L"Henüz kopyalanmış bir şey yok", Rect{20, 10 + kHead, kW - 40, kRow}, 13.5f, 400, WithA(kWhite, 0.55f), DWRITE_TEXT_ALIGNMENT_CENTER);
+    } else {
+        const int n = std::min<int>(kRows, static_cast<int>(m_items.size()) - m_top);
+        for (int i = 0; i < n; ++i) {
+            const int idx = m_top + i;
+            const Rect r = RowRect(i);
+            const bool sel = idx == m_sel, hot = idx == m_hover;
+            if (sel) { m_g.FillRR(r, 12, WithA(vl, 0.26f)); m_g.StrokeRR(r, 12, WithA(vl, 0.7f), 1.2f); }
+            else if (hot) m_g.FillRR(r, 12, WithA(vl, 0.12f));
+            if (idx < 9) m_g.Text(std::to_wstring(idx + 1), Rect{r.x + 10, r.y, 16, r.height}, 11.5f, 500, WithA(kWhite, 0.38f), DWRITE_TEXT_ALIGNMENT_CENTER);
+            m_g.Text(OneLine(m_items[static_cast<size_t>(idx)].text, 160), Rect{r.x + 34, r.y, r.width - 34 - 92, r.height}, 13.5f, sel ? 600 : 400, kWhite);
+            m_g.Text(AgeText(m_items[static_cast<size_t>(idx)].at), Rect{r.Right() - 84, r.y, 44, r.height}, 11.5f, 400, WithA(kWhite, 0.42f), DWRITE_TEXT_ALIGNMENT_TRAILING);
+            if (sel || hot) m_g.Glyph(0xE711, Rect{r.Right() - 34, r.y + (r.height - 24) / 2, 24, 24}, 10.0f, WithA(kWhite, hot ? 0.7f : 0.45f));   // remove
+        }
+    }
+    const Rect cr = ClearRect();
+    m_g.Text(L"Enter: yapıştır   Del: sil   Esc: kapat", Rect{panel.x + 20, cr.y, 270, cr.height}, 11.5f, 400, WithA(kWhite, 0.42f));
+    if (!m_items.empty()) m_g.Text(L"Tümünü temizle", cr, 12.0f, 500, WithA(vl, m_hover == -2 ? 1.0f : 0.8f), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    m_g.End();
+}
+
+LRESULT CALLBACK ClipPanel::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    ClipPanel* self = nullptr;
+    if (m == WM_NCCREATE) {
+        self = static_cast<ClipPanel*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+        SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        if (self) self->m_hwnd = h;
+    } else self = reinterpret_cast<ClipPanel*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    return self ? self->Handle(m, w, l) : DefWindowProcW(h, m, w, l);
+}
+
+LRESULT ClipPanel::Handle(UINT m, WPARAM w, LPARAM l) {
+    const int n = static_cast<int>(m_items.size());
+    auto reveal = [&]() { if (m_sel < m_top) m_top = m_sel; else if (m_sel >= m_top + kRows) m_top = m_sel - kRows + 1; };
+    switch (m) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(m_hwnd, &ps); EndPaint(m_hwnd, &ps); Render(); return 0; }
+    case WM_KILLFOCUS: Hide(); return 0;
+    case WM_TIMER:
+        if (w == 1) {                                                          // paste into the window that was in front
+            // Win / Alt still held (Enter pressed right after Win+V): wait a little, or the target would get Win+Ctrl+V
+            if ((shellkeys::KeyHeld(VK_LWIN) || shellkeys::KeyHeld(VK_RWIN) || shellkeys::KeyHeld(VK_MENU)) && ++m_pasteTries < 12) return 0;
+            m_pasteTries = 0;
+            KillTimer(m_hwnd, 1);
+            INPUT in[4] = {};
+            for (auto& i : in) i.type = INPUT_KEYBOARD;
+            in[0].ki.wVk = VK_CONTROL; in[1].ki.wVk = 'V'; in[2].ki.wVk = 'V'; in[2].ki.dwFlags = KEYEVENTF_KEYUP; in[3].ki.wVk = VK_CONTROL; in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(4, in, sizeof(INPUT));
+        }
+        return 0;
+    case WM_KEYDOWN:
+        switch (w) {
+            case VK_ESCAPE: Hide(); return 0;
+            case VK_RETURN: Commit(m_sel); return 0;
+            case VK_UP: if (m_sel > 0) --m_sel; reveal(); break;
+            case VK_DOWN: if (m_sel + 1 < n) ++m_sel; reveal(); break;
+            case VK_HOME: m_sel = 0; reveal(); break;
+            case VK_END: m_sel = std::max(0, n - 1); reveal(); break;
+            case VK_DELETE: Remove(m_sel); break;
+            default:
+                if (w >= '1' && w <= '9' && static_cast<int>(w - '1') < n) { Commit(static_cast<int>(w - '1')); return 0; }
+        }
+        Render();
+        return 0;
+    case WM_MOUSEWHEEL: {
+        const int d = GET_WHEEL_DELTA_WPARAM(w) > 0 ? -1 : 1;
+        m_top = std::clamp(m_top + d, 0, std::max(0, n - kRows));
+        Render();
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        const float x = GET_X_LPARAM(l) / m_scale, y = GET_Y_LPARAM(l) / m_scale;
+        const int hr = HitRow(x, y);
+        const int hv = hr >= 0 ? hr : (n > 0 && ClearRect().Contains(x, y) ? -2 : -1);
+        if (hv != m_hover) { m_hover = hv; Render(); }
+        TRACKMOUSEEVENT t = {sizeof(t), TME_LEAVE, m_hwnd, 0}; TrackMouseEvent(&t);
+        return 0;
+    }
+    case WM_MOUSELEAVE: if (m_hover != -1) { m_hover = -1; Render(); } return 0;
+    case WM_LBUTTONDOWN: {
+        const float x = GET_X_LPARAM(l) / m_scale, y = GET_Y_LPARAM(l) / m_scale;
+        const int hr = HitRow(x, y);
+        if (hr >= 0) {
+            const Rect r = RowRect(hr - m_top);
+            if (x >= r.Right() - 40) { Remove(hr); Render(); } else Commit(hr);        // the little x removes, the rest pastes
+        } else if (n > 0 && ClearRect().Contains(x, y)) { m_items.clear(); m_sel = m_top = 0; m_hover = -1; Reshape(); Render(); }
+        return 0;
+    }
+    }
+    return DefWindowProcW(m_hwnd, m, w, l);
+}
+
+// =============================================================================================================================
+//   Win+Arrow : snap / maximize / restore / minimize, Win+Shift+Arrow: to the next monitor
+// =============================================================================================================================
+std::map<HWND, RECT> g_snapSaved;      // the window's visible rect before it was snapped, to give back on restore
+
+bool Snappable(HWND h) {
+    if (!h || !IsWindow(h) || !IsWindowVisible(h)) return false;
+    const LONG st = static_cast<LONG>(GetWindowLongPtrW(h, GWL_STYLE));
+    if (!(st & WS_THICKFRAME) || !(st & WS_MAXIMIZEBOX)) return false;           // dialogs and fixed-size windows are left alone
+    wchar_t cls[64] = {}; GetClassNameW(h, cls, 64);
+    static const wchar_t* skip[] = {L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"AetherBarClass", L"AetherDesktopWindow"};
+    for (auto* s : skip) if (!wcscmp(cls, s)) return false;
+    return true;
+}
+RECT VisibleRect(HWND h) {
+    RECT r{}; if (FAILED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)))) GetWindowRect(h, &r);
+    return r;
+}
+// Puts the VISIBLE part of the window (without the invisible resize borders Windows 10/11 add) at `want`.
+void PlaceVisible(HWND h, RECT want) {
+    if (IsZoomed(h) || IsIconic(h)) ShowWindow(h, SW_RESTORE);
+    RECT wr{}, vr = VisibleRect(h); GetWindowRect(h, &wr);
+    const int l = vr.left - wr.left, t = vr.top - wr.top, r = wr.right - vr.right, b = wr.bottom - vr.bottom;
+    SetWindowPos(h, nullptr, want.left - l, want.top - t, (want.right - want.left) + l + r, (want.bottom - want.top) + t + b, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+bool Near(const RECT& a, const RECT& b) { return std::abs(a.left - b.left) <= 3 && std::abs(a.top - b.top) <= 3 && std::abs(a.right - b.right) <= 3 && std::abs(a.bottom - b.bottom) <= 3; }
+
+void SnapWindow(UINT vk, bool shift) {
+    for (auto it = g_snapSaved.begin(); it != g_snapSaved.end();) it = IsWindow(it->first) ? std::next(it) : g_snapSaved.erase(it);   // closed windows (and reused handles)
+    HWND h = GetAncestor(GetForegroundWindow(), GA_ROOT);
+    if (!Snappable(h)) return;
+    HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(mon, &mi);
+    const RECT wa = mi.rcWork;
+    const int mid = (wa.left + wa.right) / 2;
+    const RECT left{wa.left, wa.top, mid, wa.bottom}, right{mid, wa.top, wa.right, wa.bottom};
+
+    if (shift && (vk == VK_LEFT || vk == VK_RIGHT)) {                              // to the neighbouring monitor, keeping the shape
+        std::vector<HMONITOR> mons;
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM l) -> BOOL { reinterpret_cast<std::vector<HMONITOR>*>(l)->push_back(m); return TRUE; }, reinterpret_cast<LPARAM>(&mons));
+        if (mons.size() < 2) return;
+        auto leftOf = [](HMONITOR a, HMONITOR b) { MONITORINFO x = {sizeof(x)}, y = {sizeof(y)}; GetMonitorInfoW(a, &x); GetMonitorInfoW(b, &y); return x.rcMonitor.left < y.rcMonitor.left; };
+        std::sort(mons.begin(), mons.end(), leftOf);
+        const size_t at = static_cast<size_t>(std::find(mons.begin(), mons.end(), mon) - mons.begin());
+        const size_t to = vk == VK_RIGHT ? (at + 1) % mons.size() : (at + mons.size() - 1) % mons.size();
+        MONITORINFO ni = {sizeof(ni)}; GetMonitorInfoW(mons[to], &ni);
+        if (IsZoomed(h)) { ShowWindow(h, SW_RESTORE); }
+        const RECT vr = VisibleRect(h);
+        const double sx = double(ni.rcWork.right - ni.rcWork.left) / (wa.right - wa.left), sy = double(ni.rcWork.bottom - ni.rcWork.top) / (wa.bottom - wa.top);
+        RECT want{ni.rcWork.left + static_cast<LONG>((vr.left - wa.left) * sx), ni.rcWork.top + static_cast<LONG>((vr.top - wa.top) * sy), 0, 0};
+        want.right = want.left + static_cast<LONG>((vr.right - vr.left) * sx); want.bottom = want.top + static_cast<LONG>((vr.bottom - vr.top) * sy);
+        const bool wasMax = (GetWindowLongPtrW(h, GWL_STYLE) & WS_MAXIMIZE) != 0;
+        PlaceVisible(h, want);
+        if (wasMax) ShowWindow(h, SW_MAXIMIZE);
+        return;
+    }
+
+    enum { Normal, Max, Min, Left, Right } st = Normal;
+    if (IsIconic(h)) st = Min;
+    else if (IsZoomed(h)) st = Max;
+    else { const RECT vr = VisibleRect(h); if (Near(vr, left)) st = Left; else if (Near(vr, right)) st = Right; }
+
+    auto restore = [&]() {
+        auto it = g_snapSaved.find(h);
+        if (it != g_snapSaved.end()) { PlaceVisible(h, it->second); g_snapSaved.erase(it); return; }
+        const int w = (wa.right - wa.left) * 7 / 10, hh = (wa.bottom - wa.top) * 7 / 10;
+        PlaceVisible(h, RECT{wa.left + ((wa.right - wa.left) - w) / 2, wa.top + ((wa.bottom - wa.top) - hh) / 2, wa.left + ((wa.right - wa.left) - w) / 2 + w, wa.top + ((wa.bottom - wa.top) - hh) / 2 + hh});
+    };
+    auto snapTo = [&](const RECT& r) {
+        if (st == Normal) g_snapSaved[h] = VisibleRect(h);                    // always the CURRENT free-floating rect
+        else if (st == Max) { ShowWindow(h, SW_RESTORE); g_snapSaved[h] = VisibleRect(h); }
+        PlaceVisible(h, r);
+    };
+    switch (vk) {
+        case VK_LEFT:  if (st == Right) restore(); else if (st != Left) snapTo(left); break;
+        case VK_RIGHT: if (st == Left) restore(); else if (st != Right) snapTo(right); break;
+        case VK_UP:
+            if (st == Min) ShowWindow(h, SW_RESTORE);
+            else if (st != Max) { if (st == Normal) g_snapSaved[h] = VisibleRect(h); ShowWindow(h, SW_MAXIMIZE); }
+            break;
+        case VK_DOWN:
+            if (st == Max) { ShowWindow(h, SW_RESTORE); g_snapSaved.erase(h); }
+            else if (st == Left || st == Right) restore();
+            else if (st == Normal) ShowWindow(h, SW_MINIMIZE);
+            break;
+    }
+}
+
+// =============================================================================================================================
 //   the global keyboard hook
 // =============================================================================================================================
 // The hook lives on a thread of its own that does nothing else. A low-level hook has to answer within ~300 ms; on the main
@@ -721,9 +1096,15 @@ struct Proc {
     int crashes{0};
     ULONGLONG windowStart{0};
     ULONGLONG restartAt{0};
+    // An elevated exe started through the scheduled task has no handle we can wait on: its window class tells whether it is up.
+    const wchar_t* cls{nullptr};
+    bool viaTask{false};          // started by the task; supervised through `cls`
+    bool seen{false};             // `cls` has been seen at least once since the start
+    ULONGLONG deadline{0};        // the task start counts as failed when `cls` has not shown up by then
+    int startFails{0};            // consecutive failed start attempts (a required exe is retried before Windows' own shell takes over)
 };
 std::vector<Proc> g_procs;
-bool g_realShell = false, g_fallbackStarted = false;
+bool g_realShell = false, g_fallbackStarted = false, g_elevationDeclined = false;
 std::vector<HWND> g_minimized;
 
 // AetherBar.exe asks for administrator rights; a non-elevated process cannot start it directly. The autostart option creates a
@@ -739,10 +1120,27 @@ bool StartViaTask(const std::wstring& exe) {
     STARTUPINFOW si = {sizeof(si)}; PROCESS_INFORMATION pi = {};
     if (!CreateProcessW(tool.c_str(), cl.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
     CloseHandle(pi.hThread);
-    DWORD code = 1;
+    DWORD code = 0;     // a slow Task Scheduler (right at logon) is not a failure: Supervise() checks that the bar really came up
     if (WaitForSingleObject(pi.hProcess, 4000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess);
     return code == 0;
+}
+
+// The task is missing / points to another copy of the exe / did not bring the exe up: ask for the elevation directly (one UAC prompt).
+// The elevated bar then repairs the task itself, so this is a one-time cost.
+bool StartElevated(Proc& p) {
+    SHELLEXECUTEINFOW sei = {sizeof(sei)};
+    const std::wstring dir = ExeDir();
+    g_elevationDeclined = false;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb = L"runas"; sei.lpFile = p.exe.c_str(); sei.lpDirectory = dir.c_str(); sei.nShow = SW_SHOWNORMAL;
+    sei.lpParameters = L"--repair-task";                            // the elevated bar re-points its logon task to this copy
+    if (!ShellExecuteExW(&sei)) { g_elevationDeclined = GetLastError() == ERROR_CANCELLED; return false; }
+    if (p.h) CloseHandle(p.h);
+    p.h = sei.hProcess;                                             // may be null on some systems: then `cls` supervises
+    p.viaTask = p.h == nullptr;
+    p.seen = false; p.deadline = GetTickCount64() + 8000;
+    return true;
 }
 
 bool StartProc(Proc& p) {
@@ -751,12 +1149,20 @@ bool StartProc(Proc& p) {
     std::wstring cl = L"\"" + p.exe + L"\"";
     const std::wstring dir = ExeDir();
     if (!CreateProcessW(p.exe.c_str(), cl.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi)) {
-        if (GetLastError() == ERROR_ELEVATION_REQUIRED) return StartViaTask(p.exe);
-        return false;
+        if (GetLastError() != ERROR_ELEVATION_REQUIRED) return false;
+        p.viaTask = false; p.seen = false;
+        if (p.cls && FindWindowW(p.cls, nullptr)) { p.viaTask = true; p.seen = true; return true; }   // already running (elevated): adopt it
+        // The task is only trusted when it starts THIS exe; schtasks /Run says "ok" for a task whose file is gone or crashes at once.
+        if (aether::system::bartask::Exists() && aether::system::bartask::RunsExe(p.exe) && StartViaTask(p.exe)) {
+            p.viaTask = true; p.deadline = GetTickCount64() + 8000;
+            return true;
+        }
+        return StartElevated(p);
     }
     CloseHandle(pi.hThread);
     if (p.h) CloseHandle(p.h);
     p.h = pi.hProcess;
+    p.viaTask = false;
     return true;
 }
 
@@ -770,13 +1176,38 @@ void StartExplorerFallback() {
     if (CreateProcessW(ex.c_str(), cl.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
 }
 
+// A required exe (the bar) that could not be started is retried for a while before Windows' own shell takes over. Falling back at the first
+// hiccup (the Task Scheduler is often not ready yet right at logon) put Windows' taskbar on screen, and the bar then came up under / over it.
+// A missing exe or a declined UAC prompt will not get better by asking again: those go to Windows' shell at once.
+void StartFailed(Proc& p, bool final = false) {
+    if (!p.required || !g_realShell) return;
+    if (!final && ++p.startFails < 6) p.restartAt = GetTickCount64() + 2500;
+    else StartExplorerFallback();
+}
+
 void Supervise() {
     const ULONGLONG now = GetTickCount64();
     for (auto& p : g_procs) {
+        if (p.viaTask) {                                            // started by the task: no handle yet, the window tells
+            HWND w = p.cls ? FindWindowW(p.cls, nullptr) : nullptr;
+            if (w) {
+                DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+                if (HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) { p.h = h; p.viaTask = false; p.startFails = 0; }
+                else p.seen = true;                                 // cannot wait on it, but it is up
+                if (!p.h) continue;
+            } else {
+                p.viaTask = false;
+                if (p.seen) continue;                               // it was up and has gone (closed): leave it closed
+                if (now < p.deadline) { p.viaTask = true; continue; }   // still starting
+                // the task did not bring it up in time (stale path, crash): ask directly
+                if (!StartElevated(p)) StartFailed(p, g_elevationDeclined);
+                continue;
+            }
+        }
         if (!p.h) {
             if (p.restartAt && now >= p.restartAt) {                // a delayed restart (never Sleep here: the main thread must stay responsive)
                 p.restartAt = 0;
-                if (!StartProc(p) && p.required && g_realShell) StartExplorerFallback();
+                if (!StartProc(p)) StartFailed(p, g_elevationDeclined || !FileExists(p.exe));
             }
             continue;
         }
@@ -887,6 +1318,10 @@ LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case kMsgSwCommit: g_sw.Commit(); return 0;
     case kMsgSwCancel: g_sw.Cancel(); return 0;
     case kMsgRun: g_run.Open(); return 0;
+    case shellkeys::kMsgClip: g_clip.Open(); return 0;
+    case shellkeys::kMsgSnap: SnapWindow(static_cast<UINT>(w), l != 0); return 0;
+    case WM_CLIPBOARDUPDATE: g_clip.OnClipboardChanged(); return 0;
+    case WM_APP + 13: g_clip.AddText(reinterpret_cast<std::wstring*>(l)); return 0;     // the clipboard worker's text
     case kMsgMinAll: MinimizeAll(w != 0); return 0;
     case kMsgSettings: ShellExecuteW(nullptr, L"open", L"ms-settings:", nullptr, nullptr, SW_SHOWNORMAL); return 0;
     case kMsgWinCombo:                                              // the bar must not open Start when the Win key is released
@@ -903,8 +1338,7 @@ LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     aether::core::InstallCrashHandler(L"AetherShell");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    HANDLE once = CreateMutexW(nullptr, TRUE, L"Aether.Shell.SingleInstance");
-    if (once && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (!aether::core::AcquireSingleInstance(L"Aether.Shell.SingleInstance")) return 0;
     SetCurrentProcessExplicitAppUserModelID(L"Aether.Shell");
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
@@ -919,6 +1353,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     RegisterClassExW(&wc);
     g_ctl = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, nullptr);
     if (!g_ctl) return 1;
+    if (g_realShell) AddClipboardFormatListener(g_ctl);              // the clipboard history (Win+V); with explorer.exe running, Windows has its own
 
     const std::wstring dir = ExeDir();
     if (g_realShell && !FileExists(AppData() + L"\\no-intro")) {          // greeting animation at logon; the desktop loads behind it
@@ -930,12 +1365,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         }
     }
     g_procs.push_back({dir + L"\\AetherBar.exe", true});
+    g_procs.back().cls = L"AetherBarClass";
     g_procs.push_back({dir + L"\\AetherDesktop.exe", false});
     g_procs.push_back({dir + L"\\Aether.exe", false});
     for (auto& p : g_procs) {
         p.windowStart = GetTickCount64();
         if (StartProc(p)) Sleep(250);
-        else if (p.required && g_realShell) StartExplorerFallback();   // no bar = no usable desktop: fall back to Windows' own
+        else StartFailed(p, g_elevationDeclined || !FileExists(p.exe));   // no bar = no usable desktop: retried, and only then Windows' own shell
     }
     SetTimer(g_ctl, kTimerSupervise, 2000, nullptr);
     StartKeyHook();
