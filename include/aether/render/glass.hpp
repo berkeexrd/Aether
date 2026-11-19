@@ -81,8 +81,9 @@ struct ThemeDef {
     float hue{20.0f};                 // degrees the second accent is rotated from the accent (kAccent2)
     float sat{1.0f};                  // saturation scale of the second accent
 };
+inline constexpr int kSystemTheme = 9;   // follows the Windows accent colour (which Wallpaper Engine can set from the wallpaper)
 inline const ThemeDef* Themes(int* count) {
-    static const ThemeDef t[] = {
+    static ThemeDef t[] = {
         // Violet body colours were measured from the concept (deep saturated purple, not grey-violet)
         {L"Violet", L"Mor",        {0.545f,0.361f,0.965f,1}, {0.722f,0.592f,1.0f,1}, {0.388f,0.227f,0.882f,1}, {0.088f,0.052f,0.138f,0.935f}, {0.046f,0.028f,0.074f,0.950f}, 1.0f, 1.0f, 0.16f, 0.60f, false, false, 20.0f, 1.12f},
         {L"OLED Black", L"OLED Siyah", {0.80f,0.72f,1.0f,1}, {0.93f,0.90f,1.0f,1}, {0.55f,0.45f,0.95f,1}, {0.0f,0.0f,0.0f,0.985f}, {0.0f,0.0f,0.0f,0.99f}, 0.30f, 0.15f, 0.22f, 0.50f, false, false, 10.0f, 1.0f},
@@ -93,12 +94,51 @@ inline const ThemeDef* Themes(int* count) {
         {L"Classic", L"Klasik",    {0.38f,0.80f,1.0f,1}, {0.55f,0.86f,1.0f,1}, {0.0f,0.47f,0.83f,1}, {0.125f,0.125f,0.135f,0.900f}, {0.090f,0.090f,0.100f,0.925f}, 0.0f, 0.0f, 0.18f, 0.45f, false, true, 0.0f, 1.0f},
         {L"Lavender", L"Lavanta",  {0.72f,0.58f,1.0f,1}, {0.86f,0.78f,1.0f,1}, {0.52f,0.38f,0.95f,1}, {0.165f,0.105f,0.262f,0.84f}, {0.100f,0.062f,0.178f,0.90f}, 0.90f, 1.0f, 0.28f, 0.45f, true, false, 16.0f, 1.05f},
         {L"Sunset", L"Gün Batımı", {1.0f,0.55f,0.18f,1}, {1.0f,0.76f,0.45f,1}, {0.90f,0.34f,0.10f,1}, {0.150f,0.095f,0.060f,0.955f}, {0.090f,0.055f,0.035f,0.965f}, 0.95f, 1.0f, 0.16f, 0.60f, false, false, -12.0f, 1.0f},
+        // rewritten by RefreshSystemAccent(); these are the colours until the system accent has been read
+        {L"System accent", L"Sistem vurgusu", {0.0f,0.47f,0.83f,1}, {0.38f,0.70f,1.0f,1}, {0.0f,0.30f,0.60f,1}, {0.050f,0.075f,0.120f,0.950f}, {0.030f,0.045f,0.075f,0.960f}, 1.0f, 1.0f, 0.16f, 0.60f, false, false, 16.0f, 1.0f},
     };
     if (count) *count = static_cast<int>(sizeof(t) / sizeof(t[0]));
     return t;
 }
 inline int& ThemeIndex() { static int i = 6; return i; }   // first launch: Classic
+
+// The Windows accent colour (Settings > Personalisation > Colours). Wallpaper Engine ("Adjust Windows colours") writes the wallpaper's scheme
+// colour there, so a theme that follows it follows the wallpaper. Returns false when it cannot be read.
+inline bool ReadSystemAccent(core::Color& out) {
+    DWORD v = 0, n = sizeof(v);
+    float r, g, b;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM", L"AccentColor", RRF_RT_REG_DWORD, nullptr, &v, &n) == ERROR_SUCCESS) {
+        r = (v & 0xFF) / 255.0f; g = ((v >> 8) & 0xFF) / 255.0f; b = ((v >> 16) & 0xFF) / 255.0f;        // 0xAABBGGRR
+    } else {
+        n = sizeof(v);
+        if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM", L"ColorizationColor", RRF_RT_REG_DWORD, nullptr, &v, &n) != ERROR_SUCCESS) return false;
+        r = ((v >> 16) & 0xFF) / 255.0f; g = ((v >> 8) & 0xFF) / 255.0f; b = (v & 0xFF) / 255.0f;        // 0xAARRGGBB
+    }
+    out = core::Color{r, g, b, 1.0f};
+    return true;
+}
+// Builds the "System accent" theme from one colour; true when the theme changed.
+inline bool RefreshSystemAccent() {
+    static float lr = -1, lg = -1, lb = -1;
+    core::Color a;
+    if (!ReadSystemAccent(a)) return false;
+    if (std::fabs(a.r - lr) < 0.002f && std::fabs(a.g - lg) < 0.002f && std::fabs(a.b - lb) < 0.002f) return false;
+    lr = a.r; lg = a.g; lb = a.b;
+    const float mx = std::max({a.r, a.g, a.b});
+    if (mx < 0.72f && mx > 0.001f) { const float k = 0.72f / mx; a.r = std::min(1.0f, a.r * k); a.g = std::min(1.0f, a.g * k); a.b = std::min(1.0f, a.b * k); }   // a very dark accent is lifted so it stays readable
+    else if (mx <= 0.001f) a = core::Color{0.45f, 0.45f, 0.50f, 1.0f};
+    int n = 0; ThemeDef* t = const_cast<ThemeDef*>(Themes(&n));
+    ThemeDef& d = t[kSystemTheme];
+    auto mixw = [](const core::Color& c, float k) { return core::Color{c.r + (1 - c.r) * k, c.g + (1 - c.g) * k, c.b + (1 - c.b) * k, 1.0f}; };
+    d.accent = core::Color{a.r, a.g, a.b, 1.0f};
+    d.light = mixw(a, 0.38f);
+    d.deep = core::Color{a.r * 0.68f, a.g * 0.68f, a.b * 0.68f, 1.0f};
+    d.bodyTop = core::Color{0.030f + a.r * 0.105f, 0.030f + a.g * 0.105f, 0.030f + a.b * 0.105f, 0.950f};
+    d.bodyBot = core::Color{0.016f + a.r * 0.060f, 0.016f + a.g * 0.060f, 0.016f + a.b * 0.060f, 0.962f};
+    return true;
+}
 inline void SetTheme(int i) {
+    if (i == kSystemTheme) RefreshSystemAccent();
     int n = 0; const ThemeDef* t = Themes(&n);
     if (i < 0 || i >= n) i = 0;
     ThemeIndex() = i; kViolet = t[i].accent; kVioletLight = t[i].light; kVioletDeep = t[i].deep;
@@ -131,16 +171,19 @@ inline bool SyncTheme() {
     const ULONGLONG now = GetTickCount64();
     if (last && now - last < 1000) return false;
     last = now;
-    const std::wstring p = ThemeFilePath(); if (p.empty()) return false;
+    // the system accent changed (Wallpaper Engine / Windows settings): a theme that follows it is rebuilt
+    const bool accentMoved = RefreshSystemAccent() && ThemeIndex() == kSystemTheme;
+    if (accentMoved) SetTheme(kSystemTheme);
+    const std::wstring p = ThemeFilePath(); if (p.empty()) return accentMoved;
     WIN32_FILE_ATTRIBUTE_DATA fa;
-    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fa)) return false;
-    if (fa.ftLastWriteTime.dwLowDateTime == lastWrite.dwLowDateTime && fa.ftLastWriteTime.dwHighDateTime == lastWrite.dwHighDateTime) return false;
+    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fa)) return accentMoved;
+    if (fa.ftLastWriteTime.dwLowDateTime == lastWrite.dwLowDateTime && fa.ftLastWriteTime.dwHighDateTime == lastWrite.dwHighDateTime) return accentMoved;
     lastWrite = fa.ftLastWriteTime;
     HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) return accentMoved;
     char b[16] = {}; DWORD r = 0; ReadFile(h, b, 15, &r, nullptr); CloseHandle(h);
     const int i = atoi(b); const int old = ThemeIndex(); SetTheme(i);
-    return ThemeIndex() != old;
+    return ThemeIndex() != old || accentMoved;
 }
 }
 

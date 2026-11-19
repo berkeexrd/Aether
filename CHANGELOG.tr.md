@@ -2,6 +2,12 @@
 
 ## [Yayınlanmadı]
 
+### Explorer görünümleri ve ikonlar, sistem vurgusu teması
+- **Windows'unkine benzer Görünüm menüsü**: çok büyük / büyük / orta / küçük simgeler, **Listele**, **Ayrıntılar**, **Döşemeler**, önizleme paneli ve **Göster** alt menüsü: gezinti bölmesi, kompakt görünüm, öğe onay kutuları, dosya adı uzantıları, gizli öğeler. Seçimler hatırlanır.
+- **Sağ tık için boş alan**: son satırın altında boş bir şerit var; dolu bir klasörde bile Yeni / Yapıştır / Görünüm menüsüne ulaşılır.
+- **Daha çok dosyada gerçek ikon**: Windows'ta programı kayıtlı türler (betikler, JSON, kaynak dosyaları ...) uzantı rozeti yerine o programın ikonunu gösterir; program ve kısayollar, etkin ikon paketinde karşılığı varsa onun resmini kullanır.
+- **Sistem vurgusu teması**: Windows vurgu rengini izleyen onuncu tema. Wallpaper Engine ("Windows renklerini ayarla") duvar kağıdının şema rengini oraya yazar; böylece island, çubuk, paneller, widget'lar ve ayarlar duvar kağıdının renklerini alır. Değişiklik bir saniye içinde yansır; bu temada duvar kağıdına dokunulmaz.
+
 ### Windows'un kendi kabuk yüzeyleri yerine Aether
 - **Ses göstergesi**: ses veya sessiz durumu değişince (tuşlar, karıştırıcı, herhangi bir uygulama, çubuğun tekerleği) çubuğun üstünde hoparlör simgesi, seviye çubuğu ve yüzdeyle cam bir hap kayarak gelir. Ses tuşlarını artık AetherBar kendisi işler (%2 adım, sessize alma), böylece Windows'un kendi ses penceresi yanında görünmez. Varsayılan çalma aygıtı değişince onu izler.
 - **Windows'un kendi arayüzü uzak durur**: çubuk çalışırken Windows'un Başlat, Arama, Widget'lar / Başlat akışı ve hızlı ayarlar / takvim / bildirim flyout'larının ana süreçleri Windows başlatır başlatmaz sonlandırılır (Aether kapanınca Windows yeniden başlatır; `--keep-stock` bunu kapatır). `Win`+`S` / `Win`+`Q` Aether'in Başlat'ını (aramayı) açar; `Win`+`W`, `Win`+`A`, `Win`+`N` Windows flyout'u açmak yerine bir şey yapmaz. `Shift` / `Ctrl` / `Alt` ile kombinasyonlar (ör. `Win`+`Shift`+`S` ekran kesme) Windows'a bırakılır.

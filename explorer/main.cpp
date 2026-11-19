@@ -33,6 +33,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include "aether/system/icon_pack.hpp"
 #include "aether/bar/ui_common.hpp"
 #include "aether/render/context_menu.hpp"
 #include "aether/render/dcomp_layer.hpp"
@@ -77,7 +78,9 @@ constexpr ULONG_PTR kOpenPathMagic = 0x41455850;
 constexpr wchar_t kWindowClass[] = L"AetherExplorerWindow";
 constexpr wchar_t kInstanceMutex[] = L"Local\\AetherExplorerSingleInstance";
 
-constexpr float kTitleH = 44.0f, kSideW = 236.0f, kToolbarH = 60.0f, kRowH = 38.0f, kHeadH = 34.0f, kCmdH = 44.0f, kStatusH = 30.0f;
+constexpr float kTitleH = 44.0f, kToolbarH = 60.0f, kHeadH = 34.0f, kCmdH = 44.0f, kStatusH = 30.0f;
+// these two follow the View > Show options (navigation pane, compact view): the layout code reads them like constants
+static float kSideW = 236.0f, kRowH = 38.0f;
 
 // busy = work is going on (a moving bar in the progress card); false = a final message (an error), shown for a few seconds
 inline void PostXfer(HWND h, const std::wstring& t, bool busy = true) {
@@ -638,6 +641,15 @@ private:
     SortKey m_sortKey{SortKey::Name};
     bool m_sortAsc{true};
     bool m_showHidden{false};
+    int m_layout{0};                                               // grid layouts: 0 icons, 1 list, 2 tiles
+    bool m_checks{false};                                          // item check boxes: with them a click toggles the item
+    bool m_hideExt{false}, m_compact{false}, m_sideShown{true};   // View > Show: file name extensions off, compact rows, navigation pane
+    void ApplyViewPrefs() { kRowH = m_compact ? 30.0f : 38.0f; kSideW = m_sideShown ? 236.0f : 0.0f; }
+    std::wstring DispName(const FileEntry& e) const {
+        if (!m_hideExt || e.dir) return e.name;
+        const size_t d = e.name.find_last_of(L'.');
+        return d != std::wstring::npos && d > 0 ? e.name.substr(0, d) : e.name;
+    }
     std::wstring m_pendingSelect;
     std::vector<Tab> m_tabs{Tab{}};
     int m_tab{0};
@@ -699,6 +711,9 @@ private:
 
     // icon cache
     std::unordered_map<std::wstring, ComPtr<ID2D1Bitmap1>> m_icons;
+    std::unordered_map<std::wstring, ComPtr<ID2D1Bitmap1>> m_packIcons;     // PNGs of the active icon pack, by file name
+    ID2D1Bitmap1* AssocIcon(const std::wstring& ext);                     // the icon Windows has registered for this file type; null when there is none
+    ID2D1Bitmap1* PackIcon(const std::wstring& fullPath);                 // the active icon pack's picture for this program, or null
     ComPtr<ID2D1PathGeometry> m_wave, m_waveFill; float m_waveW{0}, m_waveH{0};
     ComPtr<ID2D1PathGeometry> m_swirl;
     std::map<int, ComPtr<ID2D1PathGeometry>> m_polys;
@@ -962,7 +977,7 @@ LRESULT Explorer::Handle(UINT m, WPARAM w, LPARAM l) {
         if (m_edit != E_None && id != H_Search && id != H_PathBox && id != H_Row + m_renameIndex) CommitEdit();
         const bool ctrl = (w & MK_CONTROL) != 0, shift = (w & MK_SHIFT) != 0;
         m_pressRow = -1;
-        if (id >= H_Row) RowDown(id - H_Row, ctrl, shift);
+        if (id >= H_Row) RowDown(id - H_Row, ctrl || (m_checks && !shift), shift);   // with check boxes a plain click toggles
         else if (id == 0 && !m_home && m_listRect.Contains(m_mx, m_my)) {
             m_marquee = true; m_mqX = m_mx; m_mqY = m_my + m_scroll;
             if (ctrl) m_mqBase = m_sel; else { m_mqBase.assign(m_sel.size(), 0); std::fill(m_sel.begin(), m_sel.end(), 0); }
@@ -1267,6 +1282,38 @@ ID2D1Bitmap1* Explorer::FileIcon(const std::wstring& fullPath, const std::wstrin
     return bmp.Get();
 }
 
+// The icon of the program that is registered for a file type (VS Code for .json, Python for .py, the editor for .ps1 ...). Types nobody
+// has registered show Windows' blank page: those are detected by their system icon index and get Aether's own badge instead.
+ID2D1Bitmap1* Explorer::AssocIcon(const std::wstring& ext) {
+    if (ext.empty()) return nullptr;
+    static const int generic = [] {
+        SHFILEINFOW g{};
+        return SHGetFileInfoW(L"file.aether-no-such-type", FILE_ATTRIBUTE_NORMAL, &g, sizeof(g), SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX) ? g.iIcon : -1;
+    }();
+    const std::wstring key = L"assoc:" + ext;
+    auto it = m_icons.find(key);
+    if (it != m_icons.end()) return it->second.Get();
+    if (m_iconBudget <= 0) { m_needRedrawForIcons = true; return nullptr; }
+    --m_iconBudget;
+    ComPtr<ID2D1Bitmap1> bmp;
+    SHFILEINFOW sfi{};
+    const std::wstring fake = L"file" + ext;
+    if (SHGetFileInfoW(fake.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi), SHGFI_USEFILEATTRIBUTES | SHGFI_ICON | SHGFI_LARGEICON | SHGFI_SYSICONINDEX) && sfi.hIcon) {
+        if (sfi.iIcon != generic) bmp = bui::IconToBitmap(m_ctx, sfi.hIcon, 32);
+        DestroyIcon(sfi.hIcon);
+    }
+    m_icons[key] = bmp;
+    return bmp.Get();
+}
+
+ID2D1Bitmap1* Explorer::PackIcon(const std::wstring& fullPath) {
+    const std::wstring png = aether::system::iconpack::Find(fullPath);
+    if (png.empty()) return nullptr;
+    auto it = m_packIcons.find(png);
+    if (it == m_packIcons.end()) it = m_packIcons.emplace(png, aether::system::iconpack::LoadBitmap(m_ctx, png)).first;
+    return it->second.Get();
+}
+
 // ---- vector icons (no Windows shell icons: everything is drawn in the Aether style) -------------------------------
 enum IconKind { K_Desktop = 0, K_Downloads, K_Documents, K_Pictures, K_Music, K_Videos, K_Drive = 10, K_Windows, K_PC, K_Net, K_Linux, K_Folder };
 
@@ -1425,9 +1472,11 @@ void Explorer::DrawFileGlyph(const FileEntry& e, const std::wstring& fullPath, c
     if (in({L".doc", L".docx"})) { Badge(L"W", r, Color{0.30f, 0.56f, 1.0f, 1.0f}, Color{0.12f, 0.34f, 0.84f, 1.0f}, kWhite, false); return; }
     if (in({L".xls", L".xlsx", L".csv"})) { Badge(L"X", r, Color{0.26f, 0.78f, 0.46f, 1.0f}, Color{0.10f, 0.50f, 0.28f, 1.0f}, kWhite, false); return; }
     if (in({L".ppt", L".pptx"})) { Badge(L"P", r, Color{1.0f, 0.55f, 0.30f, 1.0f}, Color{0.84f, 0.30f, 0.12f, 1.0f}, kWhite, false); return; }
-    if (in({L".exe", L".lnk", L".url", L".scr", L".msi"})) {          // the real application icon is the useful one here
+    if (in({L".exe", L".lnk", L".url", L".scr", L".msi"})) {          // the real application icon is the useful one here (the icon pack's, when it has one)
+        if (auto* bmp = PackIcon(fullPath)) { m_ctx->DrawBitmap(bmp, D(r), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR); return; }
         if (auto* bmp = FileIcon(fullPath, x)) { m_ctx->DrawBitmap(bmp, D(r), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR); return; }
     }
+    if (auto* bmp = AssocIcon(x)) { m_ctx->DrawBitmap(bmp, D(r), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR); return; }   // the program registered for this type
     std::wstring lab = x.empty() ? L"•" : x.substr(1);
     for (auto& c : lab) c = static_cast<wchar_t>(towupper(c));
     if (lab.size() > 4) lab.resize(4);
@@ -2542,7 +2591,7 @@ void Explorer::OpenExternal(const std::wstring& path) {
 
 void Explorer::DrawTabs(float W) {
     const Color vl = render::glass::kVioletLight, v = render::glass::kViolet, text = render::glass::kText, muted = render::glass::kMuted;
-    const float x0 = kSideW + 70, x1 = W - 3 * 46 - 58;
+    const float x0 = std::max(kSideW, 90.0f) + 70, x1 = W - 3 * 46 - 58;
     const int n = static_cast<int>(m_tabs.size());
     const float plus = 32;
     const float tw = std::clamp((x1 - x0 - plus - 4) / std::max(1, n), 76.0f, 200.0f);
@@ -2605,6 +2654,11 @@ void Explorer::LoadCfg() {
         else if (k == L"sort") m_sortKey = static_cast<SortKey>(std::clamp(iv, 0, 3));
         else if (k == L"asc") m_sortAsc = iv != 0;
         else if (k == L"hidden") m_showHidden = iv != 0;
+        else if (k == L"hideext") m_hideExt = iv != 0;
+        else if (k == L"layout") m_layout = std::clamp(iv, 0, 2);
+        else if (k == L"checks") m_checks = iv != 0;
+        else if (k == L"compact") m_compact = iv != 0;
+        else if (k == L"side") m_sideShown = iv != 0;
         else if (k == L"icon") m_iconSize = std::clamp(static_cast<float>(iv), 48.0f, 192.0f);
         else if (k == L"pin" && !val.empty() && m_pins.size() < 12) m_pins.push_back(val);
         else if (k == L"conn" && m_conns.size() < 24) {
@@ -2616,12 +2670,14 @@ void Explorer::LoadCfg() {
             }
         }
     }
+    ApplyViewPrefs();
 }
 void Explorer::SaveCfg() {
     const std::wstring p = CfgPath();
     if (p.empty()) return;
     std::wstring w = L"grid=" + std::to_wstring(m_grid ? 1 : 0) + L"\npreview=" + std::to_wstring(m_preview ? 1 : 0) + L"\nsort=" + std::to_wstring(static_cast<int>(m_sortKey)) +
-                     L"\nasc=" + std::to_wstring(m_sortAsc ? 1 : 0) + L"\nhidden=" + std::to_wstring(m_showHidden ? 1 : 0) + L"\nicon=" + std::to_wstring(static_cast<int>(m_iconSize)) + L"\n";
+                     L"\nasc=" + std::to_wstring(m_sortAsc ? 1 : 0) + L"\nhidden=" + std::to_wstring(m_showHidden ? 1 : 0) + L"\nicon=" + std::to_wstring(static_cast<int>(m_iconSize)) +
+                     L"\nlayout=" + std::to_wstring(m_layout) + L"\nchecks=" + std::to_wstring(m_checks ? 1 : 0) + L"\nhideext=" + std::to_wstring(m_hideExt ? 1 : 0) + L"\ncompact=" + std::to_wstring(m_compact ? 1 : 0) + L"\nside=" + std::to_wstring(m_sideShown ? 1 : 0) + L"\n";
     for (const auto& pin : m_pins) w += L"pin=" + pin + L"\n";
     for (const auto& c : m_conns)
         w += L"conn=" + c.name + L"\t" + c.host + L"\t" + std::to_wstring(c.port) + L"\t" + c.user + L"\t" + ProtectPass(c.pass) + L"\t" + c.path + L"\n";
@@ -2647,7 +2703,7 @@ void Explorer::TogglePin(const std::wstring& p) {
 Rect Explorer::CellRect(int vi) const {
     if (!m_grid) return Rect{m_lx, m_ly + 4 + vi * kRowH - m_scroll, m_lw - 14, kRowH - 2};
     const int c = vi % std::max(1, m_cols), r = vi / std::max(1, m_cols);
-    return Rect{m_lx + c * m_cellW, m_ly + 4 + r * m_cellH - m_scroll, m_cellW - 8, m_cellH - 8};
+    return Rect{m_lx + c * m_cellW, m_ly + 4 + r * m_cellH - m_scroll, m_cellW - 8, m_cellH - (m_layout ? 4 : 8)};
 }
 
 void Explorer::RowDown(int vi, bool ctrl, bool shift) {
@@ -2944,16 +3000,36 @@ void Explorer::BreadcrumbMenu(int idx, POINT pt) {
 
 void Explorer::ViewMenu(POINT pt) {
     using aether::ui::MenuItem;
-    const int c = aether::ui::ShowContextMenu({MenuItem(1, L"Ayrıntılar", bui::kGlyphView, false, !m_grid ? L"●" : L""), MenuItem(2, L"Küçük simgeler", 0xE80A, false, m_grid && m_iconSize < 80 ? L"●" : L""),
-                                               MenuItem(3, L"Büyük simgeler", 0xE80A, false, m_grid && m_iconSize >= 80 && m_iconSize < 120 ? L"●" : L""),
-                                               MenuItem(4, L"Çok büyük simgeler", 0xE80A, false, m_grid && m_iconSize >= 120 ? L"●" : L""),
-                                               aether::ui::MenuSeparator(), MenuItem(5, L"Önizleme paneli", 0xE8A1, false, m_preview ? L"●" : L"")}, pt);
+    const float s = m_iconSize;
+    const auto dot = [](bool on) -> std::wstring { return on ? L"●" : L""; };
+    const bool icons = m_grid && m_layout == 0;
+    const int c = aether::ui::ShowContextMenu({MenuItem(4, L"Çok büyük simgeler", 0xE80A, false, dot(icons && s >= 128)), MenuItem(3, L"Büyük simgeler", 0xE80A, false, dot(icons && s >= 96 && s < 128)),
+                                               MenuItem(6, L"Orta boyutlu simgeler", 0xE80A, false, dot(icons && s >= 68 && s < 96)), MenuItem(2, L"Küçük simgeler", 0xE80A, false, dot(icons && s < 68)),
+                                               MenuItem(8, L"Listele", bui::kGlyphView, false, dot(m_grid && m_layout == 1)), MenuItem(1, L"Ayrıntılar", bui::kGlyphView, false, dot(!m_grid)),
+                                               MenuItem(9, L"Döşemeler", 0xE80A, false, dot(m_grid && m_layout == 2)),
+                                               aether::ui::MenuSeparator(), MenuItem(5, L"Önizleme paneli", 0xE8A1, false, dot(m_preview)),
+                                               MenuItem(7, L"Göster", 0xE7B3)}, pt);
     if (c == 1) m_grid = false;
-    else if (c == 2) { m_grid = true; m_iconSize = 64; }
-    else if (c == 3) { m_grid = true; m_iconSize = 96; }
-    else if (c == 4) { m_grid = true; m_iconSize = 144; }
+    else if (c == 2) { m_grid = true; m_layout = 0; m_iconSize = 56; }
+    else if (c == 6) { m_grid = true; m_layout = 0; m_iconSize = 80; }
+    else if (c == 3) { m_grid = true; m_layout = 0; m_iconSize = 112; }
+    else if (c == 4) { m_grid = true; m_layout = 0; m_iconSize = 160; }
+    else if (c == 8) { m_grid = true; m_layout = 1; }
+    else if (c == 9) { m_grid = true; m_layout = 2; }
     else if (c == 5) m_preview = !m_preview;
-    if (c) { SaveCfg(); m_scrollTarget = std::min(m_scrollTarget, 1e6f); Kick(); }
+    else if (c == 7) {                                              // like Explorer's View > Show submenu
+        const int k = aether::ui::ShowContextMenu({MenuItem(1, L"Gezinti bölmesi", bui::kGlyphFolder, false, dot(m_sideShown)), MenuItem(2, L"Kompakt görünüm", 0xE8FD, false, dot(m_compact)),
+                                                   MenuItem(5, L"Öğe onay kutuları", 0xE73A, false, dot(m_checks)),
+                                                   aether::ui::MenuSeparator(), MenuItem(3, L"Dosya adı uzantıları", 0xE8A5, false, dot(!m_hideExt)),
+                                                   MenuItem(4, L"Gizli öğeler", 0xE7B3, false, dot(m_showHidden) + L" Ctrl+H")}, pt);
+        if (!k) return;
+        if (k == 1) m_sideShown = !m_sideShown;
+        else if (k == 2) m_compact = !m_compact;
+        else if (k == 3) m_hideExt = !m_hideExt;
+        else if (k == 4) { m_showHidden = !m_showHidden; RebuildView(); }
+        else if (k == 5) m_checks = !m_checks;
+    }
+    if (c) { ApplyViewPrefs(); SaveCfg(); m_scrollTarget = std::min(m_scrollTarget, 1e6f); Kick(); }
 }
 
 void Explorer::TxtWrap(const std::wstring& s, const Rect& r, float size, int weight, const Color& c) {
@@ -2994,7 +3070,7 @@ void Explorer::Render() {
 
     DrawBackground(W, H);
     if (m_home) DrawHome(W, H); else DrawFolder(W, H);
-    DrawSidebar(H);
+    if (kSideW > 0.5f) DrawSidebar(H);
     DrawToolbar(W);
     DrawTitleBar(W);
     DrawJobs(W, H);
@@ -3176,7 +3252,7 @@ void Explorer::DrawTitleBar(float W) {
     const bool canBack = m_histPos > 0, canFwd = m_histPos + 1 < static_cast<int>(m_hist.size());
     for (int i = 0; i < 2; ++i) {
         const bool en = i == 0 ? canBack : canFwd;
-        const Rect r{kSideW - 8.0f + i * 34.0f, 7, 30, 30};
+        const Rect r{std::max(kSideW, 90.0f) - 8.0f + i * 34.0f, 7, 30, 30};
         const int id = i == 0 ? H_Back : H_Fwd;
         const float h = en ? Hover(id) : 0.0f;
         FillRR(r, 9, WithA(vl, 0.18f * h));
@@ -3882,12 +3958,17 @@ void Explorer::DrawFolder(float W, float H) {
     const float rowsTop = m_grid ? listTop + 4 : listTop + kHeadH;
     const Rect view{kSideW, rowsTop, W - kSideW - prevW, H - rowsTop - kStatusH};
     m_lx = x0; m_lw = pw; m_ly = rowsTop;
-    if (m_grid) { m_cellW = m_iconSize + 36; m_cellH = m_iconSize + 64; m_cols = std::max(1, static_cast<int>((pw - 14) / m_cellW)); }
+    if (m_grid) {
+        if (m_layout == 1) { m_cellW = 270; m_cellH = 32; }                  // list: names in columns
+        else if (m_layout == 2) { m_cellW = 310; m_cellH = 68; }             // tiles: icon, name and details side by side
+        else { m_cellW = m_iconSize + 36; m_cellH = m_iconSize + 64; }
+        m_cols = std::max(1, static_cast<int>((pw - 14) / m_cellW));
+    }
     else { m_cols = 1; m_cellH = kRowH; }
     const int n = static_cast<int>(m_view.size());
     const int rowsN = (n + m_cols - 1) / m_cols;
     m_viewH = view.height;
-    m_contentH = rowsN * m_cellH + 8;
+    m_contentH = rowsN * m_cellH + 8 + 96.0f;                   // empty strip below the last row: always a place to right-click (New, Paste, View ...)
     m_scrollTarget = std::clamp(m_scrollTarget, 0.0f, std::max(0.0f, m_contentH - m_viewH));
     m_scroll = std::clamp(m_scroll, 0.0f, std::max(0.0f, m_contentH - m_viewH));
     m_listRect = view;
@@ -3929,7 +4010,24 @@ void Explorer::DrawFolder(float W, float H) {
         const bool cutRow = m_clipCut && std::find(m_clipPaths.begin(), m_clipPaths.end(), full) != m_clipPaths.end();
         if (cutRow) m_ctx->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(), nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(), 0.45f), nullptr);
 
-        if (m_grid) {
+        if (m_grid && m_layout) {                                            // list / tiles
+            const bool tiles = m_layout == 2;
+            const float S2 = tiles ? 46.0f : 22.0f;
+            const Rect ic{r.x + (m_checks ? 30.0f : 10.0f), r.y + (r.height - S2) * 0.5f, S2, S2};
+            DrawFileGlyph(e, full, ic);
+            const float tx = ic.Right() + 12, tw = r.Right() - tx - 8;
+            if (m_edit == E_Rename && m_renameIndex == i) {
+                const Rect er{tx - 4, r.y + 3, tw + 4, r.height - 6};
+                FillRR(er, 8, Color{0, 0, 0, 0.5f}); StrokeRR(er, 8, vl, 1.5f);
+                DrawEditSel(er.x + 6, er.y + 4, er.height - 8, 12.5f, er.x + er.width - 6, 3, vl);
+                Txt(m_editText, Rect{er.x + 6, er.y, er.width - 12, er.height}, 12.5f, 400, kWhite);
+                DrawEditCaret(er.x + 6, er.y + 5, er.height - 10, 12.5f, er.x + er.width - 8, vl);
+            } else if (tiles) {
+                Txt(DispName(e), Rect{tx, r.y + 10, tw, 22}, 13, sel ? 600 : 500, sel ? kWhite : text);
+                const std::wstring info = e.dir ? std::wstring(L"Klasör") : TypeName(e) + L"  ·  " + FormatSize(e.size);
+                Txt(info, Rect{tx, r.y + 33, tw, 20}, 11.5f, 400, muted);
+            } else Txt(DispName(e), Rect{tx, r.y, tw, r.height}, 13, sel ? 600 : 400, sel ? kWhite : text);
+        } else if (m_grid) {
             const float S = m_iconSize;
             const Rect ic{r.x + (r.width - S) * 0.5f, r.y + 8, S, S};
             bool drew = false;
@@ -3950,7 +4048,7 @@ void Explorer::DrawFolder(float W, float H) {
                 DrawEditSel(er.x + 6, er.y + 4, er.height - 8, 12.0f, er.x + er.width - 6, 3, vl);
                 Txt(m_editText, Rect{er.x + 6, er.y, er.width - 12, er.height}, 12, 400, kWhite);
                 DrawEditCaret(er.x + 6, er.y + 5, er.height - 10, 12.0f, er.x + er.width - 8, vl);
-            } else TxtWrap(e.name, Rect{r.x + 4, ic.Bottom() + 6, r.width - 8, 36}, 12, sel ? 600 : 400, sel ? kWhite : text);
+            } else TxtWrap(DispName(e), Rect{r.x + 4, ic.Bottom() + 6, r.width - 8, 36}, 12, sel ? 600 : 400, sel ? kWhite : text);
         } else {
             DrawFileGlyph(e, full, Rect{r.x + 16, r.y + 3, 28, 28});
             if (m_edit == E_Rename && m_renameIndex == i) {
@@ -3959,11 +4057,19 @@ void Explorer::DrawFolder(float W, float H) {
                 DrawEditSel(er.x + 8, er.y + 4, er.height - 8, 13.5f, er.x + er.width - 8, 3, vl);
                 Txt(m_editText, Rect{er.x + 8, er.y, er.width - 16, er.height}, 13.5f, 400, kWhite);
                 DrawEditCaret(er.x + 8, er.y + 6, er.height - 12, 13.5f, er.x + er.width - 10, vl);
-            } else Txt(e.name, Rect{r.x + 56, r.y, nameW - 56, r.height}, 13.5f, sel ? 600 : 400, sel ? kWhite : text);
+            } else Txt(DispName(e), Rect{r.x + 56, r.y, nameW - 56, r.height}, 13.5f, sel ? 600 : 400, sel ? kWhite : text);
             const bool netRoot = !m_home && !m_deep && IsNetRoot(m_path), netServer = !m_home && !m_deep && IsUncServer(m_path);
             if (!netRoot && !netServer) Txt(FormatDate(e.mtime), Rect{x0 + 16 + nameW, r.y, colDate - 8, r.height}, 12.5f, 400, muted);
             if (colType > 0) Txt(netRoot ? L"Bilgisayar" : (netServer ? L"Paylaşılan klasör" : (m_deep ? e.parent : TypeName(e))), Rect{x0 + 16 + nameW + colDate, r.y, colType - 8, r.height}, 12.5f, 400, muted);
             if (!e.dir) Txt(FormatSize(e.size), Rect{x0 + pw - colSize - 12, r.y, colSize, r.height}, 12.5f, 400, muted, 2);
+        }
+        if (m_checks) {                                                      // check box: always on selected rows, on hover for the others
+            const float cs = 16.0f;
+            const Rect cb = m_grid && !m_layout ? Rect{r.x + 6, r.y + 6, cs, cs} : Rect{r.x + 8, r.y + (r.height - cs) * 0.5f, cs, cs};
+            if (sel || hv > 0.05f) {
+                if (sel) { FillRR(cb, 5, vl); Glyph(0xE73E, cb, 10.0f, Color{0.08f, 0.04f, 0.16f, 1.0f}); }
+                else StrokeRR(cb, 5, WithA(kWhite, 0.65f), 1.4f);
+            }
         }
         if (cutRow) m_ctx->PopLayer();
         Hit(r, id);

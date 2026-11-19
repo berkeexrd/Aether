@@ -121,6 +121,7 @@ inline void SetFile(const std::wstring& path) {
 }
 
 inline void ApplyForTheme(int theme) {
+    if (theme == 9) return;                       // "System accent": the colours follow the user's own wallpaper, so it is left alone
     const std::wstring dir = ExeDir() + L"\\wallpapers\\";
     const std::wstring path = dir + FileFor(theme);
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;

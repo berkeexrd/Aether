@@ -5,6 +5,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), versions follow
 
 ## [Unreleased]
 
+### Explorer views and icons, system accent theme
+- **View menu like Windows' own**: extra large / large / medium / small icons, **List**, **Details**, **Tiles**, preview pane, and a **Show** submenu: navigation pane, compact view, item check boxes, file name extensions, hidden items. The choices are remembered.
+- **Blank space to right-click**: an empty strip below the last row, so New / Paste / View are always within reach, even in a full folder.
+- **Real icons for more files**: types that have a program registered in Windows (scripts, JSON, source files ...) show that program's icon instead of an extension badge; programs and shortcuts use the active icon pack's picture when it has one.
+- **System accent theme**: a tenth theme that follows the Windows accent colour. Wallpaper Engine ("Adjust Windows colours") writes the wallpaper's scheme colour there, so the island, bar, panels, widgets and settings take the wallpaper's colours. Changes are picked up within a second; the wallpaper itself is left alone with this theme.
+
 ### Aether instead of Windows' own shell surfaces
 - **Volume pop-up**: a glass pill with speaker icon, level bar and percentage slides up above the bar whenever the volume or mute state changes (keys, mixer, any app, the bar's wheel). The volume keys are now handled by AetherBar itself (2 % steps, mute toggle), so Windows' own volume flyout no longer shows next to it. Follows the default playback device when it changes.
 - **Windows' own UI stays away**: while the bar runs, the host processes of Windows' Start, Search, Widgets / Start feed and the quick settings / calendar / notification flyouts are ended the moment Windows starts them (Windows starts them again after Aether is closed; `--keep-stock` turns this off). `Win`+`S` / `Win`+`Q` open Aether's Start (search); `Win`+`W`, `Win`+`A`, `Win`+`N` do nothing instead of opening a Windows flyout. Combinations with `Shift` / `Ctrl` / `Alt` (e.g. `Win`+`Shift`+`S`, the screen snip) are left to Windows.
